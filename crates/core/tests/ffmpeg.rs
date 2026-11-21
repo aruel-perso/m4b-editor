@@ -275,3 +275,80 @@ fn mp3_padding_does_not_shift_following_chapters() {
     assert_eq!(probe.chapters[1].start_ms, 1000);
     assert!(probe.track.duration_ms.abs_diff(2000) < 100);
 }
+
+/// Opt-in acceptance for a complete multi-track transcode, full output decode,
+/// and cancellation during a running encoder with an isolated destination.
+#[test]
+#[ignore = "long-form synthetic audio workflow; needs FFmpeg and 450 MiB free"]
+fn long_form_export_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = DesktopFfmpeg::default();
+    let mut inputs = Vec::new();
+    for i in [10, 2, 1] {
+        let path = dir.path().join(format!("track{i}.flac"));
+        assert!(Command::new(&backend.ffmpeg)
+            .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i"])
+            .arg(format!(
+                "sine=frequency={}:duration=300:sample_rate=12000",
+                400 + i
+            ))
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        inputs.push(path);
+    }
+    let mut project = Project::default();
+    project.import(&backend, inputs).unwrap();
+    assert_eq!(project.duration_ms(), 900_000);
+    assert!(project.tracks[1].path.ends_with("track2.flac"));
+    let output = dir.path().join("long.m4b");
+    let mut values = Vec::new();
+    let mut verified = false;
+    backend
+        .export(
+            &project,
+            &output,
+            Arc::new(AtomicBool::new(false)),
+            &mut |event| match event {
+                ExportEvent::Progress(value) => values.push(value),
+                ExportEvent::Phase(ExportPhase::VerifyingAudio) => verified = true,
+                _ => {}
+            },
+        )
+        .unwrap();
+    assert!(verified);
+    assert!(values
+        .windows(2)
+        .all(|pair| pair[1] + f32::EPSILON >= pair[0]));
+    assert!(values.iter().any(|v| (0.45..0.95).contains(v)));
+    assert_eq!(values.last(), Some(&1.));
+    let output = backend.probe(&output).unwrap();
+    assert_eq!(output.track.codec, "aac");
+    assert!(output.track.duration_ms.abs_diff(900_000) < 100);
+    assert_eq!(
+        output
+            .chapters
+            .iter()
+            .map(|c| c.start_ms)
+            .collect::<Vec<_>>(),
+        [0, 300_000, 600_000]
+    );
+
+    let cancelled = dir.path().join("cancelled.m4b");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let error = backend
+        .export(&project, &cancelled, cancel.clone(), &mut |event| {
+            if matches!(event, ExportEvent::Progress(value) if value > 0.) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert!(!cancelled.exists());
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".m4b-editor-")));
+}

@@ -3,17 +3,9 @@
   "password": "fixture (public test data)",
   "tools": {
     "ffmpeg": "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers",
-    "7z": "7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20"
+    "zip": "Rust zip 9.8.1 (AES fixture)"
   },
   "files": [
-    {
-      "path": "audio.7z",
-      "sha256": "593834fc77f8cd7e0c50e6f0beeee6628569562a411e5465d7d85bf1035a565e",
-      "expected": "valid synthetic input",
-      "container": "7z",
-      "encrypted": false,
-      "member_count": 1
-    },
     {
       "path": "audio.rar",
       "sha256": "e2fb97ee50e742bbe53f8ce13915c40549e961bdd1483a9b6eb3c1ac6aab37a1",
@@ -65,16 +57,8 @@
       "height": 2
     },
     {
-      "path": "encrypted.7z",
-      "sha256": "28b22d8cf78cf81e938dd276f35cd00af749dcc50a86b5d7b6e399b0aaab9b92",
-      "expected": "valid synthetic input",
-      "container": "7z",
-      "encrypted": true,
-      "member_count": 1
-    },
-    {
       "path": "encrypted.zip",
-      "sha256": "3a3403eb4ba2d2860b701c4895339f6f7509d371fca91859cc9af766dab452ea",
+      "sha256": "a315d11506fefee89579476f407b5c3c1c002375b1411673fe8fe4a680956e5f",
       "expected": "valid synthetic input",
       "container": "zip",
       "encrypted": true,
@@ -178,5 +162,5 @@
       "duration_tolerance_ms": 150
     }
   ],
-  "reproduction": "Python standard library for WAV/ZIP/RAR/project; FFmpeg bitexact modes for media. Exact hashes pin the corpus; encoder version differences use property tolerances. Encrypted 7z/ZIP use random salts and are retained unless --regenerate-encrypted. Public password: fixture."
+  "reproduction": "Python standard library for WAV/ZIP/RAR/project; FFmpeg bitexact modes for media. Exact hashes pin the corpus; encoder version differences use property tolerances. The AES ZIP uses a random salt and is retained unless --regenerate-encrypted. Public password: fixture."
 }

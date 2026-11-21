@@ -72,19 +72,25 @@ fn real_formats_metadata_preview_and_absolute_stream_selection() {
 }
 #[test]
 fn actual_encrypted_archives_zip64_and_cancelled_import_rollback() {
-    if let Err(error) = discover_archiver() {
-        eprintln!("SKIP optional real archive integration: {error}");
-        return;
-    }
+    let d = tempfile::tempdir().unwrap();
+    let mut project = Project::default();
+    let unsupported = d.path().join("audio.7z");
+    std::fs::copy(fixture("audio.zip"), &unsupported).unwrap();
+    assert!(project
+        .import_assets(&DesktopFfmpeg::default(), vec![unsupported], d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("Unsupported import"));
+    let disguised = d.path().join("disguised.rar");
+    std::fs::copy(fixture("audio.zip"), &disguised).unwrap();
+    assert!(project
+        .import_assets(&DesktopFfmpeg::default(), vec![disguised], d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid RAR signature"));
     let b = DesktopFfmpeg::default();
     let d = tempfile::tempdir().unwrap();
-    for name in [
-        "encrypted.7z",
-        "encrypted.zip",
-        "zip64.zip",
-        "audio.rar",
-        "audio.7z",
-    ] {
+    for name in ["encrypted.zip", "zip64.zip", "audio.rar"] {
         let mut p = Project::default();
         let assets = d.path().join(name);
         p.import_assets_with(
@@ -101,7 +107,7 @@ fn actual_encrypted_archives_zip64_and_cancelled_import_rollback() {
         assert!(p
             .import_assets_with(
                 &b,
-                vec![fixture("encrypted.7z")],
+                vec![fixture("encrypted.zip")],
                 &assets,
                 &Job::default(),
                 Some("wrong")
@@ -110,7 +116,7 @@ fn actual_encrypted_archives_zip64_and_cancelled_import_rollback() {
         assert_eq!(serde_json::to_string(&p).unwrap(), before);
         let job = Job::new(Arc::new(AtomicBool::new(true)), Duration::from_secs(1));
         assert!(p
-            .import_assets_with(&b, vec![fixture("audio.7z")], &assets, &job, None)
+            .import_assets_with(&b, vec![fixture("audio.rar")], &assets, &job, None)
             .is_err());
     }
 }
@@ -132,20 +138,7 @@ fn adding_tracks_preserves_custom_chapters_and_rejects_ambiguous_timeline() {
     assert_eq!(serde_json::to_string(&p).unwrap(), before);
 }
 #[test]
-fn genuine_rar_fixture_is_recognized_by_archiver_and_legacy_project_defaults_survive() {
-    let archiver = match discover_archiver() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("SKIP optional RAR integration: {error}");
-            return;
-        }
-    };
-    let status = std::process::Command::new(archiver)
-        .args(["t", fixture("audio.rar").to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("Type = Rar"));
+fn legacy_project_defaults_survive() {
     let project = Project::load(&fixture("legacy.json")).unwrap();
     project.validate().unwrap();
     assert_eq!(project.settings.bitrate_kbps, 96);

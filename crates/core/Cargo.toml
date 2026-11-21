@@ -11,6 +11,8 @@ tempfile.workspace = true
 dunce = "1"
 flate2 = "1"
 crc32fast = "1"
+rar-rs = "=0.15.3"
+zip = { version = "=9.8.1", default-features = false, features = ["deflate-flate2", "aes-crypto"] }
 sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]

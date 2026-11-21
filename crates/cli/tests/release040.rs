@@ -44,30 +44,26 @@ fn cli_portable_copy_stream_formats_preview_and_encrypted_import() {
     ]);
     let value: serde_json::Value = serde_json::from_slice(&fs::read(project).unwrap()).unwrap();
     assert_eq!(value["settings"]["bitrate_kbps"], 160);
-    if m4b_editor_core::discover_archiver().is_ok() {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_m4b-editor-cli"))
-            .args([
-                "import",
-                project,
-                "--password-stdin",
-                fixture("encrypted.7z").to_str().unwrap(),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(b"fixture\n").unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture"));
-    } else {
-        eprintln!("SKIP optional encrypted CLI import: no 7z/7zz available");
-    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_m4b-editor-cli"))
+        .args([
+            "import",
+            project,
+            "--password-stdin",
+            fixture("encrypted.zip").to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"fixture\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture"));
     let portable = target.path().join("portable");
     ok(&["copy", project, portable.to_str().unwrap()]);
     drop(source);

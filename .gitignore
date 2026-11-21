@@ -6,6 +6,8 @@ __pycache__/
 *.wav
 *.autosave.json
 /vendor/
+# Local user-provided test files: never commit or publish.
+/tests-local/
 .env
 .env.*
 *.pem

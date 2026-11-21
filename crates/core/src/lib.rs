@@ -4,8 +4,7 @@ mod mp4;
 pub use jobs::{available_space, preflight, required_export_bytes, Job};
 mod project;
 pub use project::{ExportFormat, ProjectBaseline};
-mod sevenzip;
-pub use sevenzip::discover as discover_archiver;
+mod rar;
 mod zip;
 // Portable project model and media contracts. Only `DesktopFfmpeg` spawns processes.
 use anyhow::{bail, ensure, Context, Result};
@@ -13,12 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
-        mpsc, Arc,
+        Arc,
     },
     time::Duration,
 };
@@ -149,8 +148,18 @@ impl Project {
     pub fn import_with_job(
         &mut self,
         backend: &dyn MediaBackend,
+        paths: Vec<PathBuf>,
+        job: &Job,
+    ) -> Result<()> {
+        self.import_observed(backend, paths, job, &mut |_| {})
+    }
+
+    fn import_observed(
+        &mut self,
+        backend: &dyn MediaBackend,
         mut paths: Vec<PathBuf>,
         job: &Job,
+        event: &mut dyn FnMut(ImportEvent),
     ) -> Result<()> {
         job.check()?;
         self.chapter_anchors()?;
@@ -161,57 +170,115 @@ impl Project {
             )
             .then_with(|| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()))
         });
-        // Probe all before mutating the project, so failed batches are transactional.
-        let tracks: Result<Vec<_>> = paths
-            .iter()
-            .map(|p| backend.probe_with_job(p, job).map(|v| v.track))
-            .collect();
-        let tracks = tracks?;
-        if self.tracks.is_empty() && paths.len() == 1 {
-            let info = backend.probe_with_job(&paths[0], job)?;
-            let mut metadata = info.metadata;
-            for (field, old) in [
-                (&mut metadata.title, &self.metadata.title),
-                (&mut metadata.author, &self.metadata.author),
-                (&mut metadata.narrator, &self.metadata.narrator),
-                (&mut metadata.description, &self.metadata.description),
-                (&mut metadata.genre, &self.metadata.genre),
-                (&mut metadata.date, &self.metadata.date),
-                (&mut metadata.copyright, &self.metadata.copyright),
-                (&mut metadata.publisher, &self.metadata.publisher),
-                (&mut metadata.book_language, &self.metadata.book_language),
-            ] {
-                if field.is_empty() {
-                    *field = old.clone();
+        let mut probes = Vec::with_capacity(paths.len());
+        event(ImportEvent::Probing {
+            done: 0,
+            total: paths.len(),
+        });
+        for path in &paths {
+            probes.push(backend.probe_with_job(path, job)?);
+            event(ImportEvent::Probing {
+                done: probes.len(),
+                total: paths.len(),
+            });
+        }
+        job.check()?;
+        let mut next = self.clone();
+        if self.tracks.is_empty() && self.chapters.is_empty() && probes.len() == 1 {
+            next.chapters.clone_from(&probes[0].chapters);
+        }
+        for (field, tag) in [
+            (
+                &mut next.metadata.title,
+                (|m: &Metadata| m.title.as_str()) as fn(&Metadata) -> &str,
+            ),
+            (&mut next.metadata.author, |m| &m.author),
+            (&mut next.metadata.narrator, |m| &m.narrator),
+            (&mut next.metadata.description, |m| &m.description),
+            (&mut next.metadata.genre, |m| &m.genre),
+            (&mut next.metadata.date, |m| &m.date),
+            (&mut next.metadata.copyright, |m| &m.copyright),
+            (&mut next.metadata.publisher, |m| &m.publisher),
+        ] {
+            if field.is_empty() && self.tracks.is_empty() {
+                let mut values = probes
+                    .iter()
+                    .map(|p| tag(&p.metadata).trim())
+                    .filter(|value| !value.is_empty() && *value != "und");
+                if let Some(value) = values.next() {
+                    if values.all(|other| other == value) {
+                        *field = value.to_owned();
+                    }
                 }
             }
-            self.metadata = metadata;
-            self.chapters = info.chapters;
-            if info.has_cover {
-                self.cover = Some(info.track.path.clone());
-            }
-            self.tracks = tracks;
-            if self.chapters.is_empty() {
-                self.reset_chapters();
-            }
-            return Ok(());
         }
+        // Audio tags may contain names, two-letter codes or multiple languages.
+        // Do not guess a conversion or import a value that prevents saving.
+        if next.metadata.book_language.is_empty() && self.tracks.is_empty() {
+            let mut values = probes
+                .iter()
+                .map(|probe| probe.metadata.book_language.trim())
+                .filter(|value| !value.is_empty() && *value != "und");
+            if let Some(value) = values.next() {
+                if value.len() == 3
+                    && value.bytes().all(|byte| byte.is_ascii_lowercase())
+                    && values.all(|other| other == value)
+                {
+                    next.metadata.book_language = value.to_owned();
+                }
+            }
+        }
+        if next.cover.is_none() && self.tracks.is_empty() {
+            let covers: Vec<_> = probes.iter().filter(|probe| probe.has_cover).collect();
+            if let Some(first) = covers.first() {
+                let mut same = covers.len() == 1;
+                if covers.len() > 1 {
+                    event(ImportEvent::ComparingCovers {
+                        done: 0,
+                        total: covers.len(),
+                    });
+                    let fingerprint = backend.cover_fingerprint(&first.track.path, job);
+                    same = fingerprint.is_some();
+                    for (index, cover) in covers.iter().enumerate().skip(1) {
+                        job.check()?;
+                        if !same || backend.cover_fingerprint(&cover.track.path, job) != fingerprint
+                        {
+                            same = false;
+                            break;
+                        }
+                        event(ImportEvent::ComparingCovers {
+                            done: index + 1,
+                            total: covers.len(),
+                        });
+                    }
+                }
+                if same {
+                    next.cover = Some(first.track.path.clone());
+                }
+            }
+        }
+        job.check()?;
+        let embedded_chapters = self.tracks.is_empty() && !next.chapters.is_empty();
         let mut start = self.duration_ms();
-        for track in tracks {
-            self.chapters.push(Chapter {
-                start_ms: start,
-                title: track
-                    .path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            });
+        for probe in probes {
+            let track = probe.track;
+            if !embedded_chapters {
+                next.chapters.push(Chapter {
+                    start_ms: start,
+                    title: track
+                        .path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                });
+            }
             start = start
                 .checked_add(track.duration_ms)
                 .context("Duration overflow")?;
-            self.tracks.push(track);
+            next.tracks.push(track);
         }
+        *self = next;
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
@@ -389,10 +456,38 @@ pub struct Probe {
     pub chapters: Vec<Chapter>,
     pub has_cover: bool,
 }
+#[derive(Clone, Copy, Debug)]
+pub enum ImportEvent {
+    Inspecting,
+    Extracting { done: usize, total: usize },
+    Probing { done: usize, total: usize },
+    ComparingCovers { done: usize, total: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ExportPhase {
+    CheckingSources,
+    PreparingTrack(usize),
+    Encoding,
+    CheckingOutput,
+    VerifyingAudio,
+    Publishing,
+}
+
 #[derive(Clone, Debug)]
 pub enum ExportEvent {
     Log(String),
     Progress(f32),
+    Phase(ExportPhase),
+    Activity {
+        media_time_us: u64,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+        stderr_category: &'static str,
+        idle_ms: u64,
+        exit_code: Option<i32>,
+        outcome: &'static str,
+    },
 }
 pub type Cancel = Arc<AtomicBool>;
 pub trait MediaBackend: Send + Sync {
@@ -402,6 +497,10 @@ pub trait MediaBackend: Send + Sync {
         let result = self.probe(path)?;
         job.check()?;
         Ok(result)
+    }
+    /// A fingerprint only when the embedded artwork can be read within limits.
+    fn cover_fingerprint(&self, _path: &Path, _job: &Job) -> Option<[u8; 32]> {
+        None
     }
     fn encoders(&self) -> Result<Vec<String>>;
     fn export(
@@ -543,7 +642,7 @@ impl DesktopFfmpeg {
         if cancel.load(AtomicOrdering::Relaxed) {
             bail!("Export cancelled");
         }
-        let mut child = command(&self.ffmpeg)
+        let child = command(&self.ffmpeg)
             .args([
                 "-hide_banner",
                 "-nostdin",
@@ -566,112 +665,18 @@ impl DesktopFfmpeg {
             .stderr(Stdio::piped())
             .spawn()
             .context("Start ffmpeg (install it or configure its path)")?;
-        let (tx, rx) = mpsc::sync_channel(128);
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let tx2 = tx.clone();
-        let out_thread = std::thread::spawn(move || {
-            for line in bounded_lines(stdout) {
-                if tx.send((true, line)).is_err() {
-                    break;
+        jobs::watch_encoder(child, &self.job, cancel, |activity| {
+            if let ExportEvent::Activity { media_time_us, .. } = activity {
+                if media_time_us > 0 {
+                    event(ExportEvent::Progress(
+                        base + span
+                            * (media_time_us as f32 / (duration_ms.max(1) as f32 * 1000.)).min(1.),
+                    ));
                 }
             }
-        });
-        let err_thread = std::thread::spawn(move || {
-            for line in bounded_lines(stderr) {
-                if tx2.send((false, line)).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut last_errors = String::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(24 * 3600);
-        let result = loop {
-            for (progress, line) in rx.try_iter().take(256) {
-                if progress {
-                    if let Some(t) = line
-                        .strip_prefix("out_time_us=")
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        event(ExportEvent::Progress(
-                            base + span
-                                * (t as f32 / (duration_ms.max(1) as f32 * 1000.)).clamp(0., 1.),
-                        ));
-                    }
-                } else {
-                    if last_errors.len() < 16384 {
-                        last_errors.push_str(&line);
-                        last_errors.push('\n');
-                    }
-                    event(ExportEvent::Log(line));
-                }
-            }
-            let stop = if cancel.load(AtomicOrdering::Relaxed) {
-                Some(anyhow::anyhow!("Export cancelled"))
-            } else if let Err(e) = self.job.check() {
-                Some(e)
-            } else if std::time::Instant::now() >= deadline {
-                Some(anyhow::anyhow!("Encoder deadline exceeded"))
-            } else {
-                None
-            };
-            if let Some(error) = stop {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(error);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => std::thread::sleep(Duration::from_millis(40)),
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(e.into());
-                }
-            }
-        };
-        while !out_thread.is_finished() || !err_thread.is_finished() {
-            for (progress, line) in rx.try_iter().take(256) {
-                if !progress {
-                    if last_errors.len() < 16384 {
-                        last_errors.push_str(&line);
-                        last_errors.push('\n');
-                    }
-                    event(ExportEvent::Log(line));
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let _ = out_thread.join();
-        let _ = err_thread.join();
-        for (progress, line) in rx.try_iter().take(256) {
-            if !progress {
-                if last_errors.len() < 16384 {
-                    last_errors.push_str(&line);
-                    last_errors.push('\n');
-                }
-                event(ExportEvent::Log(line));
-            }
-        }
-        let status = result?;
-        ensure!(status.success(), "FFmpeg failed ({status}): {last_errors}");
-        Ok(())
+            event(activity);
+        })
     }
-}
-fn bounded_lines(input: impl std::io::Read) -> impl Iterator<Item = String> {
-    let mut reader = BufReader::new(input);
-    std::iter::from_fn(move || {
-        let mut line = Vec::new();
-        use std::io::Read;
-        match reader.by_ref().take(16384).read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(
-                String::from_utf8_lossy(&line)
-                    .trim_end_matches(['\r', '\n'])
-                    .to_owned(),
-            ),
-        }
-    })
 }
 fn tag(v: &serde_json::Value, key: &str) -> String {
     v.as_object()
@@ -789,6 +794,14 @@ impl DesktopFfmpeg {
             "Invalid duration"
         );
         let tags = &v["format"]["tags"];
+        let field = |name| {
+            let value = tag(tags, name);
+            if value.is_empty() {
+                tag(&audio["tags"], name)
+            } else {
+                value
+            }
+        };
         let mut chapters: Vec<Chapter> = v["chapters"]
             .as_array()
             .map(|cs| {
@@ -819,27 +832,40 @@ impl DesktopFfmpeg {
                 stream_index: audio["index"].as_u64().map(|v| v as u32),
             },
             metadata: Metadata {
-                title: tag(tags, "title"),
-                author: tag(tags, "artist"),
-                narrator: tag(tags, "composer"),
+                title: {
+                    let album = field("album");
+                    if chapters.is_empty() && !album.is_empty() {
+                        album
+                    } else {
+                        field("title")
+                    }
+                },
+                author: {
+                    let artist = field("artist");
+                    let album_artist = field("album_artist");
+                    if chapters.is_empty() && !album_artist.is_empty() {
+                        album_artist
+                    } else {
+                        artist
+                    }
+                },
+                narrator: field("composer"),
                 description: {
-                    let description = tag(tags, "description");
+                    let description = field("description");
                     if description.is_empty() {
-                        tag(tags, "comment")
+                        field("comment")
                     } else {
                         description
                     }
                 },
-                genre: tag(tags, "genre"),
-                date: tag(tags, "date"),
-                copyright: tag(tags, "copyright"),
-                publisher: tag(tags, "publisher"),
+                genre: field("genre"),
+                date: field("date"),
+                copyright: field("copyright"),
+                publisher: field("publisher"),
                 book_language: {
                     let language = tag(&audio["tags"], "language");
-                    if language.is_empty()
-                        || (language == "und" && !tag(tags, "language").is_empty())
-                    {
-                        tag(tags, "language")
+                    if language.is_empty() || language == "und" {
+                        field("language")
                     } else {
                         language
                     }
@@ -860,6 +886,38 @@ impl MediaBackend for DesktopFfmpeg {
     }
     fn probe(&self, path: &Path) -> Result<Probe> {
         self.probe_stream(path, None)
+    }
+    fn cover_fingerprint(&self, path: &Path, job: &Job) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let mut backend = self.clone();
+        backend.job = job.clone();
+        let (path, document) = backend.probe_document(path).ok()?;
+        let index = document["streams"]
+            .as_array()?
+            .iter()
+            .find(|stream| stream["disposition"]["attached_pic"] == 1)?["index"]
+            .as_u64()?;
+        let output = jobs::capture(
+            command(&self.ffmpeg)
+                .args(["-v", "error", "-max_alloc", "67108864", "-i"])
+                .arg(path)
+                .args([
+                    "-map",
+                    &format!("0:{index}"),
+                    "-c",
+                    "copy",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "pipe:1",
+                ]),
+            job,
+            8 * 1024 * 1024,
+        )
+        .ok()?;
+        (output.status.success() && !output.stdout.is_empty())
+            .then(|| Sha256::digest(output.stdout).into())
     }
     fn encoders(&self) -> Result<Vec<String>> {
         let o = jobs::capture(
@@ -933,6 +991,7 @@ impl DesktopFfmpeg {
         let stage = tempfile::Builder::new()
             .prefix(".m4b-editor-")
             .tempdir_in(&parent)?;
+        event(ExportEvent::Phase(ExportPhase::CheckingSources));
         let mut total = 0u64;
         for t in &p.tracks {
             let fresh = self.probe_stream(&t.path, t.stream_index)?.track;
@@ -955,6 +1014,7 @@ impl DesktopFfmpeg {
             let mut decoded_durations = Vec::new();
             let mut elapsed = 0u64;
             for (i, t) in p.tracks.iter().enumerate() {
+                event(ExportEvent::Phase(ExportPhase::PreparingTrack(i + 1)));
                 event(ExportEvent::Log(format!(
                     "Preparing track {}: {}",
                     i + 1,
@@ -1170,7 +1230,10 @@ impl DesktopFfmpeg {
             }
             .into(),
         ));
-        self.run(&args, &cancel, event, 0.45, 0.50, total)?;
+        event(ExportEvent::Phase(ExportPhase::Encoding));
+        let base = if remux { 0. } else { 0.45 };
+        self.run(&args, &cancel, event, base, 0.95 - base, total)?;
+        event(ExportEvent::Phase(ExportPhase::CheckingOutput));
         if p.settings.format == ExportFormat::M4b {
             mp4::publisher(&temp, &p.metadata.publisher)?;
         }
@@ -1240,7 +1303,9 @@ impl DesktopFfmpeg {
             "null".into(),
             "-".into(),
         ];
+        event(ExportEvent::Phase(ExportPhase::VerifyingAudio));
         self.run(&args, &cancel, event, 0.95, 0.04, total)?;
+        event(ExportEvent::Phase(ExportPhase::Publishing));
         ensure!(!cancel.load(AtomicOrdering::Relaxed), "Export cancelled");
         // FlushFileBuffers on Windows requires a write-capable handle.
         fs::OpenOptions::new()
@@ -1248,6 +1313,7 @@ impl DesktopFfmpeg {
             .write(true)
             .open(&temp)?
             .sync_all()?;
+        self.job.check()?;
         fs::hard_link(&temp,
                     &output).context("Atomic no-overwrite publication failed (destination filesystem must support hard links)")?;
         event(ExportEvent::Progress(1.));

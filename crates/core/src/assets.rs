@@ -1,9 +1,6 @@
 use crate::zip;
 use crate::*;
-use std::{
-    collections::HashSet,
-    io::{Read, Write},
-};
+use std::io::{Read, Write};
 
 pub(crate) const MAX_FILES: usize = 4096;
 pub(crate) const MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -27,15 +24,22 @@ pub(crate) fn safe_name(name: &str) -> Result<PathBuf> {
         !trimmed.is_empty() && trimmed.split('/').all(|p| !p.is_empty()),
         "Empty archive path component"
     );
+    ensure!(
+        trimmed.split('/').count() <= 64,
+        "Archive path is too deeply nested"
+    );
     for part in trimmed.split('/') {
         ensure!(
-            !part.ends_with(['.', ' ']) && !part.chars().any(|c| c < ' ' || "<>\"|?*".contains(c)),
+            part.encode_utf16().count() <= 255
+                && !part.ends_with(['.', ' '])
+                && !part.chars().any(|c| c < ' ' || "<>\"|?*".contains(c)),
             "Unsafe Windows archive path: {name:?}"
         );
         let stem = part
             .split('.')
             .next()
             .unwrap_or_default()
+            .trim_end_matches(' ')
             .to_ascii_uppercase();
         ensure!(
             ![
@@ -99,6 +103,18 @@ impl Project {
         job: &Job,
         password: Option<&str>,
     ) -> Result<()> {
+        self.import_assets_observed(backend, paths, assets, job, password, &mut |_| {})
+    }
+
+    pub fn import_assets_observed(
+        &mut self,
+        backend: &dyn MediaBackend,
+        paths: Vec<PathBuf>,
+        assets: &Path,
+        job: &Job,
+        password: Option<&str>,
+        event: &mut dyn FnMut(ImportEvent),
+    ) -> Result<()> {
         job.check()?;
         ensure!(!paths.is_empty(), "Select at least one file");
         fs::create_dir_all(assets).context("Create project asset directory")?;
@@ -111,6 +127,7 @@ impl Project {
         let mut count: usize = 0;
         for (index, source) in paths.iter().enumerate() {
             job.check()?;
+            event(ImportEvent::Inspecting);
             ensure!(
                 fs::metadata(source)?.is_file(),
                 "Import source must be a regular file"
@@ -122,84 +139,19 @@ impl Project {
                 .to_ascii_lowercase();
             let root = stage.path().join(index.to_string());
             fs::create_dir(&root)?;
-            if ["rar", "7z"].contains(&ext.as_str())
-                || (ext == "zip" && (password.is_some() || zip_needs_external(source)?))
-            {
-                media.extend(crate::sevenzip::extract_options(
-                    source, &root, &mut total, &mut count, job, password,
-                )?);
-            } else if ext == "zip" {
-                let mut zip = zip::ZipArchive::new(fs::File::open(source)?)
-                    .context("Read ZIP (encrypted/unsupported archives cannot be imported)")?;
-                count = count
-                    .checked_add(zip.len())
-                    .context("Entry count overflow")?;
-                ensure!(count <= MAX_FILES, "Import exceeds 4096-entry limit");
-                let mut seen = HashSet::new();
-                let mut declared = 0u64;
-                // Validate every entry before writing anything from this archive.
-                for i in 0..zip.len() {
-                    let entry = zip
-                        .by_index(i)
-                        .context("Read ZIP entry: encrypted/unsupported entry")?;
-                    let name = safe_name(entry.name())?;
-                    ensure!(
-                        seen.insert(name.to_string_lossy().trim_end_matches('/').to_lowercase()),
-                        "Duplicate archive path: {}",
-                        entry.name()
-                    );
-                    if let Some(mode) = entry.unix_mode() {
-                        let kind = mode & 0o170000;
-                        ensure!(
-                            kind == 0 || kind == 0o100000 || (kind == 0o040000 && entry.is_dir()),
-                            "Archive links/special files forbidden: {}",
-                            entry.name()
-                        );
-                    }
-                    ensure!(
-                        entry.size() <= MAX_FILE,
-                        "ZIP entry exceeds 2 GiB: {}",
-                        entry.name()
-                    );
-                    declared = declared
-                        .checked_add(entry.size())
-                        .context("ZIP size overflow")?;
-                    ensure!(
-                        declared <= MAX_BYTES.saturating_sub(total),
-                        "ZIP exceeds 8 GiB batch expanded limit"
-                    );
-                    ensure!(
-                        !entry.is_dir() || entry.size() == 0,
-                        "Directory entry has unexpected data: {}",
-                        entry.name()
-                    );
-                    if !entry.is_dir() {
-                        ensure!(audio(&name), "Unsupported ZIP member {}; batch rejected. Extract and select audio explicitly.", entry.name());
-                    }
+            if ext == "rar" || ext == "zip" {
+                let mut batch = ArchiveBatch::new(&root, &mut total, &mut count, job, event);
+                if ext == "rar" {
+                    crate::rar::extract(source, password, &mut batch)?;
+                } else {
+                    zip::extract(source, password, &mut batch)?;
                 }
-                for i in 0..zip.len() {
-                    let mut entry = zip.by_index(i)?;
-                    let dest = root.join(safe_name(entry.name())?);
-                    if entry.is_dir() {
-                        fs::create_dir_all(&dest)?;
-                        continue;
-                    }
-                    fs::create_dir_all(dest.parent().context("ZIP parent")?)?;
-                    copy_limited(
-                        CheckedRead {
-                            input: &mut entry,
-                            job,
-                        },
-                        &dest,
-                        &mut total,
-                    )
-                    .with_context(|| format!("Extract {}", entry.name()))?;
-                    media.push(dest);
-                }
+                media.extend(batch.media);
             } else {
                 ensure!(audio(source), "Unsupported import: {}", source.display());
                 count += 1;
                 ensure!(count <= MAX_FILES, "Import exceeds 4096 files");
+                event(ImportEvent::Extracting { done: 0, total: 1 });
                 let dest = root.join(source.file_name().context("Missing filename")?);
                 copy_limited(
                     CheckedRead {
@@ -210,11 +162,12 @@ impl Project {
                     &mut total,
                 )?;
                 media.push(dest);
+                event(ImportEvent::Extracting { done: 1, total: 1 });
             }
         }
         ensure!(!media.is_empty(), "Archive contains no audio files");
         let mut next = self.clone();
-        next.import_with_job(backend, media, job)?;
+        next.import_observed(backend, media, job, event)?;
         job.check()?;
         // Persist the successful batch with a unique name, preserving prior batches.
         let old = stage.path().to_path_buf();
@@ -357,6 +310,132 @@ mod archive_tests {
         fs::write(path, data).unwrap();
     }
     #[test]
+    fn tagged_archive_uses_consensus_while_preserving_edits_and_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = DesktopFfmpeg::default();
+        let tagged_track = |name, artist, pixel| {
+            let image = temp.path().join("cover.ppm");
+            let mut ppm = b"P6\n1 1\n255\n".to_vec();
+            ppm.extend_from_slice(pixel);
+            fs::write(&image, ppm).unwrap();
+            let output = temp.path().join(name);
+            assert!(command(&backend.ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=duration=0.2",
+                    "-i"
+                ])
+                .arg(image)
+                .args([
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:v",
+                    "-c:a",
+                    "libmp3lame",
+                    "-c:v",
+                    "png",
+                    "-disposition:v",
+                    "attached_pic",
+                    "-metadata",
+                    "album=Tagged book",
+                    "-metadata",
+                    artist,
+                    "-metadata",
+                    "genre=Audiobook",
+                    "-metadata",
+                    "language=French",
+                    "-metadata"
+                ])
+                .arg(format!("title={name}"))
+                .arg(&output)
+                .status()
+                .unwrap()
+                .success());
+            fs::read(output).unwrap()
+        };
+        let a = tagged_track("track2.mp3", "artist=Artist A", &[255, 0, 0]);
+        let b = tagged_track("track10.mp3", "artist=Artist B", &[255, 0, 0]);
+        let c = tagged_track("track12.mp3", "artist=Artist B", &[0, 0, 255]);
+        let input = temp.path().join("tagged.zip");
+        archive(
+            &input,
+            &[("track10.mp3", &b, 0o100644), ("track2.mp3", &a, 0o100644)],
+        );
+        let assets = temp.path().join("assets");
+        let mut project = Project::default();
+        project.metadata.genre = "Edited genre".into();
+        let mut events = Vec::new();
+        project
+            .import_assets_observed(
+                &backend,
+                vec![input.clone()],
+                &assets,
+                &Job::default(),
+                None,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(project.metadata.title, "Tagged book");
+        assert_eq!(project.metadata.genre, "Edited genre");
+        assert!(project.metadata.book_language.is_empty());
+        project.validate().unwrap();
+        assert!(project.metadata.author.is_empty());
+        assert_eq!(project.cover.as_ref(), Some(&project.tracks[0].path));
+        assert!(project.tracks[0].path.ends_with("track2.mp3"));
+        assert!(matches!(events.first(), Some(ImportEvent::Inspecting)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ImportEvent::Extracting { done: 2, total: 2 })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ImportEvent::Probing { done: 2, total: 2 })));
+        assert!(matches!(
+            events.last(),
+            Some(ImportEvent::ComparingCovers { done: 2, total: 2 })
+        ));
+
+        project.chapters[0].title = "Edited chapter".into();
+        let previous_cover = project.cover.clone();
+        archive(
+            &input,
+            &[("track12.mp3", &c, 0o100644), ("track2.mp3", &a, 0o100644)],
+        );
+        project
+            .import_assets(&backend, vec![input.clone()], &assets)
+            .unwrap();
+        assert_eq!(project.chapters[0].title, "Edited chapter");
+        assert_eq!(project.cover, previous_cover);
+
+        let mut conflicting = Project::default();
+        conflicting
+            .import_assets(&backend, vec![input.clone()], &assets)
+            .unwrap();
+        assert!(conflicting.cover.is_none());
+        let cancel = Job::default();
+        let before = fs::read_dir(&assets).unwrap().count();
+        let mut cancelled = Project::default();
+        assert!(cancelled
+            .import_assets_observed(
+                &backend,
+                vec![input],
+                &assets,
+                &cancel,
+                None,
+                &mut |event| if matches!(event, ImportEvent::Probing { done: 1, .. }) {
+                    cancel.cancel.store(true, AtomicOrdering::Relaxed);
+                }
+            )
+            .is_err());
+        assert!(cancelled.tracks.is_empty());
+        assert_eq!(fs::read_dir(&assets).unwrap().count(), before);
+    }
+
+    #[test]
     fn persistent_transactional_import_and_named_project() {
         assert!(Project::named("  ").is_err());
         let dir = tempfile::tempdir().unwrap();
@@ -417,73 +496,130 @@ mod archive_tests {
             assert_eq!(fs::read_dir(&assets).unwrap().count(), 0);
         }
     }
-    #[cfg(unix)]
-    #[test]
-    fn real_sevenzip_import_order_and_rollback() {
-        // This is an integration test of the installed executable, not a synthetic 7z fixture.
-        let exe = match crate::discover_archiver() {
-            Ok(exe) => exe,
-            Err(error) => {
-                eprintln!("SKIP optional archiver integration: {error}");
-                return;
-            }
-        };
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["track10.mp3", "track2.mp3", "-switch.mp3"] {
-            fs::write(dir.path().join(name), b"audio").unwrap();
+    fn write_rar(path: &Path, options: rar_rs::WriterOptions, redirect: Option<u64>) {
+        let entries =
+            rar_rs::EntryWriteOptions::new().compression_level(rar_rs::CompressionLevel::STORE);
+        let mut writer = rar_rs::ArchiveWriter::create_with(path, options).unwrap();
+        writer
+            .add_bytes("book/track10.mp3", b"audio", entries)
+            .unwrap();
+        writer
+            .add_bytes("book/track2.mp3", b"audio", entries)
+            .unwrap();
+        if let Some(kind) = redirect {
+            writer
+                .add_redirect("book/link.mp3", kind, "book/track2.mp3")
+                .unwrap();
         }
-        let zip = dir.path().join("book.7z");
-        assert!(std::process::Command::new(&exe)
-            .current_dir(dir.path())
-            .args(["a", "-bd", "-spd", "--"])
-            .arg(&zip)
-            .args(["track10.mp3", "track2.mp3", "-switch.mp3"])
-            .output()
-            .unwrap()
-            .status
-            .success());
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn rar_password_integrity_and_cancellation_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let rar = dir.path().join("book.rar");
         let assets = dir.path().join("assets");
         let mut project = Project::default();
+        for encrypted_headers in [false, true] {
+            write_rar(
+                &rar,
+                rar_rs::WriterOptions::new()
+                    .password("fixture")
+                    .encrypt_headers(encrypted_headers),
+                None,
+            );
+            for password in [None, Some("wrong")] {
+                assert!(project
+                    .import_assets_with(
+                        &Backend,
+                        vec![rar.clone()],
+                        &assets,
+                        &Job::default(),
+                        password
+                    )
+                    .is_err());
+                assert!(project.tracks.is_empty());
+                assert_eq!(fs::read_dir(&assets).unwrap().count(), 0);
+            }
+            let job = Job::default();
+            let mut staged = false;
+            let result = project.import_assets_observed(
+                &Backend,
+                vec![rar.clone()],
+                &assets,
+                &job,
+                Some("fixture"),
+                &mut |event| {
+                    if matches!(event, ImportEvent::Extracting { done: 1, total: 2 }) {
+                        staged = true;
+                        job.cancel.store(true, AtomicOrdering::Relaxed);
+                    }
+                },
+            );
+            assert!(staged, "{result:?}");
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+            assert_eq!(fs::read_dir(&assets).unwrap().count(), 0);
+            assert!(project.tracks.is_empty());
+        }
+
         project
-            .import_assets(&Backend, vec![zip.clone()], &assets)
+            .import_assets_with(
+                &Backend,
+                vec![rar.clone()],
+                &assets,
+                &Job::default(),
+                Some("fixture"),
+            )
             .unwrap();
-        assert!(project.tracks[1].path.ends_with("track2.mp3"));
-        assert!(project.tracks[2].path.ends_with("track10.mp3"));
-        let before = format!("{project:?}");
-        let batches = fs::read_dir(&assets).unwrap().count();
-        // Corrupt archive, real password-protected archive, and a valid archive with bad audio.
-        fs::write(&zip, b"broken archive").unwrap();
-        assert!(project
-            .import_assets(&Backend, vec![zip.clone()], &assets)
-            .is_err());
-        fs::remove_file(&zip).unwrap();
-        assert!(std::process::Command::new(&exe)
-            .current_dir(dir.path())
-            .args(["a", "-bd", "-psecret", "--"])
-            .arg(&zip)
-            .arg("track2.mp3")
-            .output()
-            .unwrap()
-            .status
-            .success());
-        assert!(project
-            .import_assets(&Backend, vec![zip.clone()], &assets)
-            .is_err());
-        fs::remove_file(&zip).unwrap();
-        fs::write(dir.path().join("bad.mp3"), b"invalid").unwrap();
-        assert!(std::process::Command::new(&exe)
-            .current_dir(dir.path())
-            .args(["a", "-bd", "--"])
-            .arg(&zip)
-            .arg("bad.mp3")
-            .output()
-            .unwrap()
-            .status
-            .success());
-        assert!(project.import_assets(&Backend, vec![zip], &assets).is_err());
-        assert_eq!(format!("{project:?}"), before);
-        assert_eq!(fs::read_dir(&assets).unwrap().count(), batches);
+        assert!(project.tracks[0].path.ends_with("track2.mp3"));
+        assert!(project.tracks[1].path.ends_with("track10.mp3"));
+
+        write_rar(&rar, rar_rs::WriterOptions::new(), None);
+        let reader = rar_rs::ArchiveReader::open(&rar).unwrap();
+        let offset = reader.entries().nth(1).unwrap().data_offset() as usize;
+        drop(reader);
+        let mut damaged = fs::read(&rar).unwrap();
+        damaged[offset] ^= 1;
+        fs::write(&rar, damaged).unwrap();
+        let error = project
+            .import_assets(&Backend, vec![rar], &assets)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").to_lowercase().contains("crc"),
+            "{error:#}"
+        );
+        assert_eq!(project.tracks.len(), 2);
+        assert_eq!(fs::read_dir(&assets).unwrap().count(), 1);
     }
+
+    #[test]
+    fn rar_rejects_redirects_and_ancestor_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let rar = dir.path().join("book.rar");
+        let assets = dir.path().join("assets");
+        let mut project = Project::default();
+        for kind in 1..=5 {
+            write_rar(&rar, rar_rs::WriterOptions::new(), Some(kind));
+            let error = project
+                .import_assets(&Backend, vec![rar.clone()], &assets)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("redirections"), "{error:#}");
+        }
+        let mut writer = rar_rs::ArchiveWriter::create(&rar).unwrap();
+        for name in ["track.mp3", "TRACK.mp3/child.mp3"] {
+            writer
+                .add_bytes(name, b"audio", rar_rs::EntryWriteOptions::new())
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let error = project
+            .import_assets(&Backend, vec![rar.clone()], &assets)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("file ancestor"), "{error:#}");
+        assert!(project.tracks.is_empty());
+        assert_eq!(fs::read_dir(&assets).unwrap().count(), 0);
+    }
+
     #[test]
     fn separate_input_roots_keep_natural_track_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -564,25 +700,160 @@ impl<R: Read> Read for CheckedRead<'_, R> {
         self.input.read(buffer)
     }
 }
-fn zip_needs_external(path: &Path) -> Result<bool> {
-    // The built-in reader intentionally supports only classic unencrypted ZIP.
-    // ZIP64 and encrypted ZIP use the same validated external-member path.
-    use std::io::{Seek, SeekFrom};
-    let mut file = fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len >= 30 {
-        let mut header = [0; 30];
-        file.read_exact(&mut header)?;
-        if &header[..4] == b"PK\x03\x04"
-            && (header[6] & 1 != 0 || header[18..22] == [255; 4] || header[22..26] == [255; 4])
-        {
-            return Ok(true);
+
+/// Shared validation and staging for native archive readers.
+pub(crate) struct ArchiveBatch<'a> {
+    root: &'a Path,
+    total: &'a mut u64,
+    count: &'a mut usize,
+    pub job: &'a Job,
+    event: &'a mut dyn FnMut(ImportEvent),
+    paths: std::collections::HashMap<String, bool>,
+    declared: u64,
+    files: usize,
+    media: Vec<PathBuf>,
+}
+
+impl<'a> ArchiveBatch<'a> {
+    fn new(
+        root: &'a Path,
+        total: &'a mut u64,
+        count: &'a mut usize,
+        job: &'a Job,
+        event: &'a mut dyn FnMut(ImportEvent),
+    ) -> Self {
+        Self {
+            root,
+            total,
+            count,
+            job,
+            event,
+            paths: Default::default(),
+            declared: 0,
+            files: 0,
+            media: Vec::new(),
         }
     }
-    file.seek(SeekFrom::Start(len.saturating_sub(65557)))?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail)?;
-    Ok(tail
-        .windows(4)
-        .any(|s| s == b"PK\x06\x06" || s == b"PK\x06\x07"))
+
+    pub fn remaining_entries(&self) -> usize {
+        MAX_FILES - *self.count
+    }
+
+    pub fn register(&mut self, name: &str, directory: bool, size: u64) -> Result<PathBuf> {
+        self.job.check()?;
+        ensure!(
+            self.remaining_entries() > 0,
+            "Import exceeds 4096-entry limit"
+        );
+        *self.count += 1;
+        let path = safe_name(name)?;
+        let key = name.trim_end_matches('/').to_uppercase();
+        ensure!(
+            self.paths.insert(key, directory).is_none(),
+            "Duplicate archive path: {name}"
+        );
+        ensure!(size <= MAX_FILE, "Archive entry exceeds 2 GiB: {name}");
+        ensure!(
+            !directory || size == 0,
+            "Directory entry contains data: {name}"
+        );
+        self.declared += size;
+        ensure!(
+            self.declared <= MAX_BYTES - *self.total,
+            "Archive exceeds 8 GiB batch expanded limit"
+        );
+        if !directory {
+            ensure!(audio(&path), "Unsupported archive member: {name}");
+            self.files += 1;
+        }
+        Ok(path)
+    }
+
+    pub fn start(&mut self) -> Result<()> {
+        for name in self.paths.keys() {
+            self.job.check()?;
+            for (offset, _) in name.match_indices('/') {
+                ensure!(
+                    self.paths.get(&name[..offset]) != Some(&false),
+                    "Archive path has a file ancestor"
+                );
+            }
+        }
+        (self.event)(ImportEvent::Extracting {
+            done: 0,
+            total: self.files,
+        });
+        Ok(())
+    }
+
+    pub fn stage(
+        &mut self,
+        path: &Path,
+        size: u64,
+        extract: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<()> {
+        self.job.check()?;
+        ensure!(
+            size <= MAX_BYTES - *self.total,
+            "Archive output exceeds batch quota"
+        );
+        let dest = self.root.join(path);
+        fs::create_dir_all(dest.parent().context("Archive member parent")?)?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)?;
+        let mut writer = MemberWriter {
+            file,
+            job: self.job,
+            remaining: size,
+        };
+        extract(&mut writer)
+            .with_context(|| format!("Extract archive member {}", path.display()))?;
+        ensure!(
+            writer.remaining == 0,
+            "Archive member ended before its declared size"
+        );
+        writer.file.sync_all()?;
+        *self.total += size;
+        self.media.push(dest);
+        (self.event)(ImportEvent::Extracting {
+            done: self.media.len(),
+            total: self.files,
+        });
+        Ok(())
+    }
+}
+
+struct MemberWriter<'a> {
+    file: fs::File,
+    job: &'a Job,
+    remaining: u64,
+}
+
+impl Write for MemberWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.job.check().map_err(std::io::Error::other)?;
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::other(
+                "Archive output exceeds declared member size",
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+pub(crate) fn check_unix_kind(mode: u64, directory: bool) -> Result<()> {
+    let kind = mode & 0o170000;
+    ensure!(
+        kind == 0 || kind == if directory { 0o040000 } else { 0o100000 },
+        "Archive links or special files are forbidden"
+    );
+    Ok(())
 }

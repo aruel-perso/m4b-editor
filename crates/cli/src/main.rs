@@ -297,6 +297,7 @@ fn main() -> Result<()> {
             backend.export(&p, &output, cancel, &mut |e| match e {
                 ExportEvent::Log(s) => eprintln!("{s}"),
                 ExportEvent::Progress(p) => eprintln!("{:.0}%", p * 100.),
+                ExportEvent::Phase(_) | ExportEvent::Activity { .. } => {}
             })?;
         }
         Action::Mcp => mcp(&backend)?,
