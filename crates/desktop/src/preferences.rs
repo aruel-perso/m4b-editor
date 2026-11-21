@@ -1,10 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn from_project(value: &str) -> Self {
+        match value {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub language: String,
     pub sidebar: f32,
+    pub theme: Option<Theme>,
     pub recent: Vec<PathBuf>,
     pub prerelease: bool,
 }
@@ -13,6 +32,7 @@ impl Default for Preferences {
         Self {
             language: os_language(),
             sidebar: 180.,
+            theme: None,
             recent: vec![],
             prerelease: !semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .unwrap()
@@ -172,6 +192,7 @@ mod tests {
         let p = Preferences {
             language: "fr".into(),
             sidebar: 250.,
+            theme: Some(Theme::Dark),
             recent: vec![],
             prerelease: true,
         };
@@ -179,6 +200,7 @@ mod tests {
         let p = Preferences::load(&path);
         assert_eq!(p.language, "fr");
         assert_eq!(p.sidebar, 250.);
+        assert_eq!(p.theme, Some(Theme::Dark));
         assert!(p.prerelease);
     }
     #[test]
@@ -213,6 +235,7 @@ mod migration_tests {
         assert_eq!(prefs.language, "fr");
         assert_eq!(prefs.recent, vec![PathBuf::from("book.json")]);
         assert!(prefs.prerelease);
+        assert_eq!(prefs.theme, None);
         assert_eq!(std::fs::read(&old).unwrap(), bytes);
         let mut prefs = prefs;
         prefs.language = "en".into();

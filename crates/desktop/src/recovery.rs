@@ -2,6 +2,63 @@
 use m4b_editor_core::Project;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub struct Prompt {
+    pub path: PathBuf,
+    pub name: anyhow::Result<String>,
+    pub date: Option<String>,
+}
+
+impl Prompt {
+    pub fn new(path: PathBuf) -> Self {
+        let date = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(utc_date);
+        let name = Project::load(&path).map(|project| project.name);
+        Self { path, name, date }
+    }
+}
+
+fn utc_date(modified: SystemTime) -> Option<String> {
+    let seconds = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let mut days = seconds / 86_400;
+    for year in 1970..=9999 {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let year_days = 365 + u64::from(leap);
+        if days >= year_days {
+            days -= year_days;
+            continue;
+        }
+        let months = [
+            31,
+            28 + u64::from(leap),
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        for (index, length) in months.into_iter().enumerate() {
+            if days < length {
+                let (month, day) = (index + 1, days + 1);
+                let (hour, minute) = (seconds / 3600 % 24, seconds / 60 % 60);
+                return Some(format!(
+                    "{year}-{month:02}-{day:02} {hour:02}:{minute:02} UTC"
+                ));
+            }
+            days -= length;
+        }
+    }
+    None
+}
+
 pub struct Recovery {
     directory: PathBuf,
 }
@@ -83,6 +140,12 @@ fn alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn autosave_timestamp_includes_leap_day_and_utc_time() {
+        let timestamp = UNIX_EPOCH + std::time::Duration::from_secs(1_709_210_096);
+        assert_eq!(utc_date(timestamp).as_deref(), Some("2024-02-29 12:34 UTC"));
+    }
+
     #[test]
     fn independent_slots_live_conflicts_and_crash_discovery() {
         let root = tempfile::tempdir().unwrap();

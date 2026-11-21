@@ -5,7 +5,7 @@
 //! repository-rename redirects. A reviewer must create a release-only repository
 //! at aruel-perso/m4b-craft and publish independently signed update-PLATFORM.json
 //! envelopes with exact old asset names/old repository origins. It must retain
-//! the same pinned key. Windows payloads retain m4b-Craft.exe for the old helper;
+//! the same pinned key. Windows keeps launch shims at the old helper paths;
 //! the legacy Mac DMG retains m4b-Craft.app/Contents/MacOS/m4b-Craft. Once that
 //! client runs 0.4, this updater uses only the canonical origin. Supporting old
 //! installed bundle roots below never authorizes old download origins.
@@ -241,12 +241,25 @@ pub fn check(channel: Channel, busy: bool) -> Result<Verified> {
 impl Verified {
     #[cfg(test)]
     pub fn download(self, busy: bool) -> Result<Download> {
-        self.download_progress(busy, |_| {})
+        self.download_progress(busy, &std::sync::atomic::AtomicBool::new(false), |_| {})
     }
     pub fn matches_channel(&self, channel: Channel) -> bool {
         self.channel == channel
     }
-    pub fn download_progress(self, busy: bool, mut progress: impl FnMut(f32)) -> Result<Download> {
+    pub fn download_progress(
+        self,
+        busy: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut progress: impl FnMut(f32),
+    ) -> Result<Download> {
+        let check_cancel = || {
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                "Operation cancelled"
+            );
+            Ok(())
+        };
+        check_cancel()?;
         guard(busy, false, false)?;
         ensure!(supported(), "Updates require Windows x86_64 or macOS ARM64");
         let verified = verify(&self.envelope, self.channel)?;
@@ -269,6 +282,7 @@ impl Verified {
         let mut count = 0u64;
         let mut buffer = [0u8; 65536];
         loop {
+            check_cancel()?;
             let n = response.read(&mut buffer)?;
             if n == 0 {
                 break;
@@ -282,6 +296,7 @@ impl Verified {
         file.flush()?;
         let download = Download { verified, file };
         download.reverify()?;
+        check_cancel()?;
         Ok(download)
     }
 }
@@ -307,6 +322,7 @@ impl Download {
                     .args(["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDOFF])
                     .env("M4B_UPDATE_PID", std::process::id().to_string())
                     .env("M4B_UPDATE_MSI", &path)
+                    .env("M4B_UPDATE_SHA256", &self.verified.manifest.sha256)
                     .env("M4B_UPDATE_APP", &executable)
                     .env("M4B_UPDATE_LOG", error_log())
                     .spawn();
@@ -333,6 +349,8 @@ $Application = $env:M4B_UPDATE_APP
 $ErrorActionPreference = 'Stop'
 try {
     Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
+    $installerHash = (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash
+    if ($installerHash -ne $env:M4B_UPDATE_SHA256) { throw "Verified installer hash changed" }
     $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
     $child = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"' + $Installer + '"'), '/passive', '/norestart') -Wait -PassThru
     if ($child.ExitCode -notin @(0, 3010, 1641)) { throw "Windows Installer exited with code $($child.ExitCode)" }
