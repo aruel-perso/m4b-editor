@@ -17,6 +17,14 @@ Use `CARGO_BUILD_JOBS=1` on constrained hosts. One owner builds Rust/media at a
 time. Packaging scripts build fresh binaries and fail on a failed build.
 Do not package stale executables. See [testing](testing.md) and [release](release.md).
 
+## Application icon
+
+Edit `packaging/icons/app.svg` and run `python3 scripts/generate-icons.py` to
+refresh the PNG, ICO and ICNS. The generator requires FFmpeg with the
+`librsvg` decoder. Use `--check` for a byte-for-byte comparison with the
+committed assets. The reference renderer is FFmpeg 6.1.1 with librsvg 2.58.0.
+Regular builds use the committed assets.
+
 ## Media backend
 
 `scripts/fetch-media-sources.sh DIRECTORY` fetches pinned FFmpeg 8.0.1,
@@ -37,21 +45,55 @@ Rust license notices and media licenses. Each platform's media-sources ZIP
 contains the exact pinned upstream archives. Retain these sidecars with each
 release so static-library modifications can be rebuilt with the supplied recipe.
 
-## Archiver assessment
+## Native archive import
 
-[Official downloads](https://www.7-zip.org/download.html) provide Windows x64
-and native Mac ARM64 console distributions, plus corresponding source.
-[Licensing](https://www.7-zip.org/license.txt) permits redistribution with license
-notices; some decompression code has the unRAR restriction. Treat 7-Zip as a
-separate executable, preserve all notices, distribute matching source and inspect
-its dependencies/architecture before bundling. The recipes pin official 26.06
-Windows SFX, native Mac archive and matching source archive. `bundle-archiver.py`
-extracts Windows `7z.exe` and `7z.dll` as archive data, never runs the installer,
-and uses lipo on the Mac runner when thinning is necessary. Actual 26.06 Mac
-bytes are already thin ARM64. Member hashes, licenses, upstream archive hashes
-and exact cache records are verified before packaging. Both source sidecars
-include the original official archives and corresponding source. No first-launch
-download or proprietary RAR creation is provided. Real archive/password tests run
-with the bundled tools on native Mac ARM64 and Windows under Wine. Installed-layout
-tests use an unrelated working directory and verify adjacent-tool discovery.
-These checks do not certify physical GUI operation or audible playback.
+The core uses `zip 9.8.1` (MIT) with stored/deflate, ZipCrypto and AES support,
+and `rar-rs 0.15.3` for single-volume RAR. RAR's original code uses BSD-2-Clause.
+The upstream `NOTICE` and `THIRD_PARTY_LICENSES.md` credit `rars` ports under MIT
+or Apache-2.0 and the BSD-2-Clause libarchive RAR5 reference. Installers and
+license sidecars carry those notices and the `LICENSES` directory.
+
+RAR preflight accepts RAR5/RAR7 containers and legacy RAR 1.5–4.x containers
+with clear headers. RAR5 header and member encryption are supported within the
+password derivation limit. Multi-volume, self-extracting or header-encrypted
+legacy RARs and RAR alternate streams are rejected. RAR5 headers are limited
+to 2 MiB each and RAR preflight reads at most 16 MiB of headers. The modern
+decoder caps the dictionary at 64 MiB. RAR members whose packed input the
+decoder buffers are limited to 32 MiB packed. For legacy archives marked solid
+at the archive or member level, the expanded limit is 64 MiB per member because
+the decoder materializes solid members in memory. General output limits are
+2 GiB per member and 8 GiB per batch. ZIP supports ZIP64 within the same
+general entry and expanded-size limits and caps packed member data at
+8 GiB plus 32 MiB per archive. Unsupported methods report an error.
+
+Windows packaging can reuse a complete verified historical media cache with
+`scripts/package-release.py --media /path/to/cache`. The cache must include
+the FFmpeg build with LAME and the corresponding pinned sources. The packagers
+use explicit FFmpeg, zlib and LAME file lists for payloads and source archives.
+Compatible historical caches work directly.
+
+### Windows MSI presentation wizard
+
+The Windows GNU release packager requires `wixl` and `msibuild` (from
+msitools). `package-release.py` builds the per-user MSI with `wixl` and imports
+the French wizard tables with `msibuild` before the MSI is checksummed. Use
+`--wixl` and `--msibuild` to point to extracted tools when they are outside
+`PATH`. The retained WiX source describes the payload. Rebuild through the
+packager to include the wizard.
+
+In a full-UI install, **Suivant** opens the confirmation page and shows the
+resolved `INSTALLDIR`, normally `%LOCALAPPDATA%\Programs\m4b-Craft`. **Installer**
+starts installation and **Terminer** closes the completion screen. Check that
+the welcome icon appears, **Retour** returns to welcome, and **Annuler** offers
+a choice between continuing and seeing the cancellation screen. The MSI also
+provides a failure screen. The installer uses the same execute sequence for
+the wizard, `/qn` and `/passive`. Installed-product maintenance and removal
+bypass the presentation wizard.
+
+With `wixl` and msitools available, `test-release.py --scratch DIRECTORY`
+builds a small MSI and checks its wizard tables against the compiled package
+without the UI import. Add `--msi FILE` to inspect the release MSI and sidecars.
+For a Windows smoke test, run the MSI interactively, repeat with an older
+version installed using a disposable Windows account, and check install and
+uninstall with `msiexec /i FILE /qn`, `msiexec /i FILE /passive` and
+`msiexec /x FILE /qn`. Verify the app and shortcuts before and after removal.

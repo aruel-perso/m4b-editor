@@ -1,7 +1,7 @@
-# M4B Editor 0.4.0 release procedure
+# M4B Editor release procedure
 
-The stable target is 0.4.0, without an alpha suffix. Merge the code and Cargo
-version before building. The canonical repository is `aruel-perso/m4b-editor`.
+Merge the code and Cargo version before building. The 0.4.1 candidate uses
+a new MSI product version for major upgrades from 0.4.0. The canonical repository is `aruel-perso/m4b-editor`.
 No publication or repository rename is performed by the local tooling.
 
 ## Build and review
@@ -16,12 +16,12 @@ Media source and license ZIP sidecars, application source, generated media confi
 notices are mandatory. Do not distribute private planning/session notes.
 
 Collect only installer/portable/source ZIP assets and SHA-256 sidecars in a flat
-directory; run `verify-release-assets.py DIRECTORY --version 0.4.0` before signing.
+directory; run `verify-release-assets.py DIRECTORY --version VERSION` before signing.
 Run it again with `--signed` afterward; use `--legacy --signed` for the old channel.
 Keep generated MSI payload/WiX inspection files outside that upload directory.
 The workflow uploads explicit extensions and validates the exact asset set.
 
-Sign with `sign-update.py --key EXTERNAL.pem --installer FILE --version 0.4.0
+Sign with `sign-update.py --key EXTERNAL.pem --installer FILE --version VERSION
 --platform PLATFORM --out update-v2-PLATFORM.json --scratch DIRECTORY`.
 The signer derives the public key and rejects anything other than the original
 pinned Ed25519 key. Never rotate the key to get a release through. Installer
@@ -36,16 +36,19 @@ create **aruel-perso/m4b-craft** as a release-only compatibility repository.
 Preserve historical tags and original release assets there too, so old download
 URLs keep working. Disable Actions in that repository before pushing old tags;
 historical workflows must not run as new release jobs.
-Publish a real `v0.4.0` release there. Do not rely on redirects or weaken trust.
+Serve each approved compatibility release there under its versioned tag with the original trust key.
 Keep canonical manifests named `update-v2-PLATFORM.json`; old clients use
 `update-PLATFORM.json` at the old slug.
 
-The Windows MSI preserves UpgradeCode `790fce8b-e564-43b1-9701-d427fdd80c6c`
-and the old installation directory because the old helper relaunches
-`m4b-Craft.exe` there. That file is an exact copy of `m4b-editor.exe`.
-Both canonical and legacy shortcut names are provided. These are deliberate
-compatibility exceptions to the rebrand; do not remove them before old updater
-support is retired. The MSI bytes for canonical and old-named downloads match.
+The Windows MSI preserves UpgradeCode `790fce8b-e564-43b1-9701-d427fdd80c6c`.
+Starting with 0.4.1, the application installs in `Programs\M4B Editor` and
+creates the canonical Start menu shortcut and a per-user Open With registration.
+Two small launch shims at the previous MSI paths handle older PowerShell
+helpers that relaunch their exact former executable paths. They resolve the
+current executable from its MSI-owned HKCU registration. Canonical and
+old-named releases use the same MSI bytes. Upgrade and uninstall target the
+MSI's components. External projects, media, settings and recovery live
+outside this migration.
 
 Build an additional DMG with `package-macos.py --legacy --out LEGACY-BUILD-DIR`.
 It contains `m4b-Craft.app/Contents/MacOS/m4b-Craft` for the exact old helper;
@@ -56,12 +59,12 @@ The core updater must recognize both installation roots. Do not simply rename
 the canonical DMG: its internal layout is incompatible with the old helper.
 
 Run `prepare-legacy-release.py --canonical CANONICAL-DIR --legacy-dmg FILE
---out EMPTY-DIR --version 0.4.0`. This copies the Windows payload under its old
+--out EMPTY-DIR --version VERSION`. This copies the Windows payload under its old
 filename and the separately built Mac image plus source sidecars and checksums.
 Sign each legacy installer with `sign-update.py --legacy` and the same external
 key, writing `update-PLATFORM.json`. The signed URLs point strictly to
-`https://github.com/aruel-perso/m4b-craft/releases/download/v0.4.0/m4b-Craft-0.4.0-windows-x86_64.msi`
-and the corresponding `m4b-Craft-0.4.0-macos-aarch64.dmg` URL.
+`https://github.com/aruel-perso/m4b-craft/releases/download/vVERSION/m4b-Craft-VERSION-windows-x86_64.msi`
+and the corresponding `m4b-Craft-VERSION-macos-aarch64.dmg` URL.
 The compatibility repository must serve the actual files and manifests without
 redirection. Copy GPL source/license sidecars with both channels. Publish only
 after the reviewer checks exact filenames, hashes, signatures and native tests.
@@ -69,11 +72,11 @@ No live native Mac upgrade has been verified by this packaging work.
 
 ## Validation scope
 
-Official 7-Zip 26.06 archives and extracted contents are verified before bundling.
-Hosted Windows and native ARM64 Mac builds exercise the real bundled codecs and
-archive/password paths. Both canonical and compatibility DMGs are mounted and
-their installed CLI is exercised. The exact hosted MSI passes a Wine 0.3-to-0.4
-upgrade, actual AAC/MP3/FLAC exports, portable-copy and data-preserving uninstall.
+Hosted Windows and native ARM64 Mac builds exercise the bundled FFmpeg codecs
+and native ZIP/RAR import, including password paths in the workspace tests. Both canonical and compatibility DMGs are mounted and
+their installed CLI is exercised. Historical 0.4.0 MSI acceptance included a Wine upgrade from 0.3, actual
+AAC/MP3/FLAC exports, portable-copy and data-preserving uninstall. The 0.4.1
+candidate requires its own installed upgrade and uninstall acceptance.
 Wine is not native Windows certification. Physical GUI, audible playback and
 live in-app replacement remain unverified; ad hoc Mac sealing is not Developer
 ID/notarization. Real release-key signing is mandatory at publication.

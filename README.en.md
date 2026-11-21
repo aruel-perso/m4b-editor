@@ -3,7 +3,7 @@
 [Français](README.md) · English
 
 Desktop audiobook editor with French/English UI and a CLI sharing the Rust core.
-Stable release target: **0.4.0**.
+Current development candidate: **0.4.1**.
 
 [Official downloads](https://github.com/aruel-perso/m4b-editor/releases)
 
@@ -18,9 +18,8 @@ cover, then export the book. Legacy `.json` projects remain compatibility format
 keep their referenced media. A project and an exported audiobook are different
 files. The CLI is `m4b-editor-cli`; see `m4b-editor-cli --help`.
 
-The 0.4.0 recipes prepare AAC/M4B, MP3/MP3 and FLAC/FLAC with bundled encoders.
-Application acceptance results must accompany the release; planned scope is not
-proof of working behavior. Official pinned 7-Zip 26.06 is bundled for offline archive extraction. No native live Mac upgrade is claimed here.
+AAC/M4B, MP3 and FLAC exports use the bundled encoders. ZIP and RAR imports
+work offline. See [Diagnostic logs](docs/diagnostics.md) for troubleshooting.
 
 Updates require Ed25519 signatures and content verification. Migration from 0.3
 uses a compatibility repository and deliberate old technical names, explained in
@@ -31,3 +30,5 @@ the [release procedure](docs/release.md).
 
 Distributions must retain dependency licenses and corresponding sources.
 No DRM circumvention or advanced waveform editing is included.
+
+Audio import accepts ZIP and RAR. Use the archive password field for supported encrypted archives.
