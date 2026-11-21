@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run actual Windows Rust tests with the bundled media/archiver and staged fixtures."""
+"""Run actual Windows Rust tests with the bundled media tools and staged fixtures."""
 import argparse
 import json
 import os
@@ -30,7 +30,7 @@ wine = shutil.which('wine64') or '/usr/lib/wine/wine64'
 server = shutil.which('wineserver') or '/usr/lib/wine/wineserver64'
 with tempfile.TemporaryDirectory(prefix='m4b-editor-windows-tests-', dir=scratch) as temporary:
     temp = Path(temporary)
-    for name in ['ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll']:
+    for name in ['ffmpeg.exe','ffprobe.exe']:
         shutil.copy2(media/name,temp/name)
     staged_fixtures = temp/'source/tests/fixtures'
     shutil.copytree(fixtures, staged_fixtures)
@@ -57,6 +57,6 @@ with tempfile.TemporaryDirectory(prefix='m4b-editor-windows-tests-', dir=scratch
             command = [wine,str(copied),'--nocapture','--test-threads=1']
             if args.test_filter: command.append(args.test_filter)
             subprocess.run(command, cwd=temp,env=env,timeout=180,check=True)
-        print(f'PASS {len(executables)} Windows Rust test executables with bundled FFmpeg/ffprobe/7-Zip and staged fixtures',flush=True)
+        print(f'PASS {len(executables)} Windows Rust test executables with bundled FFmpeg/ffprobe and staged fixtures',flush=True)
     finally:
         subprocess.run([server,'-k'],env=env,timeout=20,check=False)

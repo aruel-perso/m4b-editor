@@ -42,14 +42,6 @@ main() {
     9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 \
     https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz \
     https://zlib.net/fossils/zlib-1.3.1.tar.gz
-  local asset digest
-  while read -r asset digest; do
-    fetch_verified "$output/$asset" "$digest" "https://github.com/ip7z/7zip/releases/download/26.06/$asset"
-  done <<'PINS'
-7z2606-x64.exe 9b697f65ecc2d9b0152f5ee96d72dde522a7827690349d9307935dacf40f42ec
-7z2606-mac.tar.xz b6f17920b4240940461dac8ef4009891881ac44d2a5ead625ede2ec8472185dd
-7z2606-src.tar.xz a4e374c8f864f51df48c2cfd0e1413ec3b2ea030deae852d6a655402ebb61ac4
-PINS
 
 }
 

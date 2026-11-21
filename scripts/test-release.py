@@ -3,6 +3,9 @@
 import argparse
 import importlib.util
 import json
+import plistlib
+import struct
+import xml.etree.ElementTree as ET
 import os
 import hashlib
 import shutil
@@ -12,14 +15,76 @@ import tempfile
 import unittest
 import zipfile
 from unittest.mock import patch
-from release_common import verify_media, SOURCES, ARCHIVER_MEMBERS, sha256
+from release_common import verify_media, SOURCES, MEDIA_BUILD_FILES, LEGACY_ARCHIVER_SOURCES, LEGACY_ARCHIVER_MEMBERS, sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('release', ROOT/'scripts/package-release.py')
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
+def verify_pe_icon(path):
+    resources = subprocess.check_output(['x86_64-w64-mingw32-objdump', '-p', str(path)], text=True)
+    tree = resources.split('The .rsrc Resource Directory section:', 1)[1]
+    assert 'Entry: ID: 0x000003,' in tree  # RT_ICON
+    assert 'Entry: ID: 0x00000e,' in tree  # RT_GROUP_ICON
+    assert (ROOT/'packaging/icons/app.png').read_bytes() in path.read_bytes()
+
+
 class ReleaseTests(unittest.TestCase):
+    def test_windows_shortcut_icon_pe(self):
+        for tool in ['windres', 'gcc', 'objdump']:
+            if not shutil.which(f'x86_64-w64-mingw32-{tool}'):
+                self.skipTest('MinGW resource tools required')
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            icon = Path(d)/release.SHORTCUT_ICON
+            release.build_shortcut_icon(icon)
+            verify_pe_icon(icon)
+            release.build_legacy_launcher(Path(d)/'legacy-launch.exe')
+
+    def test_ico_contains_the_expected_png_sizes(self):
+        ico = (ROOT/'packaging/icons/app.ico').read_bytes()
+        sizes = [16, 24, 32, 48, 64, 128, 256]
+        self.assertEqual(struct.unpack_from('<HHH', ico), (0, 1, len(sizes)))
+        end = 6 + 16 * len(sizes)
+        for index, size in enumerate(sizes):
+            width, height, _, _, planes, depth, length, start = struct.unpack_from('<BBBBHHII', ico, 6 + 16 * index)
+            self.assertEqual((width, height, planes, depth), (size % 256, size % 256, 1, 32))
+            self.assertEqual(start, end)
+            end = start + length
+            png = ico[start:end]
+            self.assertEqual(png[:16], b'\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR')
+            self.assertEqual(struct.unpack_from('>II', png, 16), (size, size))
+            if size == 64:
+                self.assertEqual(png, (ROOT/'packaging/icons/app.png').read_bytes())
+        self.assertEqual(end, len(ico))
+
+    def test_mac_bundle_icon_resource(self):
+        spec = importlib.util.spec_from_file_location('macos', ROOT/'scripts/package-macos.py')
+        macos = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(macos)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            resources = Path(d)/'Contents/Resources'
+            resources.mkdir(parents=True)
+            info = {}
+            macos.install_app_icon(resources, info)
+            plist = resources.parent/'Info.plist'
+            plist.write_bytes(plistlib.dumps(info))
+            icon = resources/plistlib.loads(plist.read_bytes())['CFBundleIconFile']
+            data = icon.read_bytes()
+            self.assertEqual(data, (ROOT/'packaging/icons/app.icns').read_bytes())
+            self.assertEqual(struct.unpack_from('>4sI', data), (b'icns', len(data)))
+            cursor = 8
+            sizes = {}
+            while cursor < len(data):
+                kind, length = struct.unpack_from('>4sI', data, cursor)
+                self.assertGreaterEqual(length, 8 + 24)
+                self.assertLessEqual(cursor + length, len(data))
+                self.assertEqual(data[cursor+8:cursor+16], b'\x89PNG\r\n\x1a\n')
+                sizes[kind] = struct.unpack_from('>II', data, cursor + 24)
+                cursor += length
+            for kind, size in [(b'icp4', 16), (b'ic07', 128), (b'ic10', 1024)]:
+                self.assertEqual(sizes[kind], (size, size))
+
     def test_copy_licenses_accepts_null_license_file(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             root = Path(d)
@@ -42,7 +107,8 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             out = Path(d)/'source'
             copy_source(out)
-            for name in ['BRIEF.md','VALIDATION.md','ALPHA-0.1.1.md','implementation-plan.md']:
+            for name in ['BRIEF.md','VALIDATION.md','ALPHA-0.1.1.md','implementation-plan.md',
+                         'tests-local']:
                 self.assertFalse((out/name).exists(), name)
             self.assertTrue((out/'docs/development.md').is_file())
             self.assertTrue((out/'crates').is_dir())
@@ -53,9 +119,21 @@ class ReleaseTests(unittest.TestCase):
             path = Path(d)
             payload = path/'payload'; payload.mkdir()
             (payload/'m4b-editor.exe').write_bytes(b'fixture')
-            (payload/'m4b-Craft.exe').write_bytes(b'fixture')
+            bridge = path/'bridge.exe'; bridge.write_bytes(b'fixture')
             source = payload/'source'; source.mkdir(); (source/'Cargo.lock').write_text('fixture')
-            wxs = path/'app.wxs'; release.wix(payload,wxs)
+            icon = path/release.SHORTCUT_ICON
+            icon.write_bytes(b'fixture')
+            wxs = path/'app.wxs'; release.wix(payload,wxs,icon,bridge)
+            product = ET.parse(wxs).getroot().find(f'{{{release.NS}}}Product')
+            icon_node = product.find(f'{{{release.NS}}}Icon')
+            self.assertEqual(wxs.parent/icon_node.attrib['SourceFile'], icon)
+            shortcuts = product.findall(f'.//{{{release.NS}}}Shortcut')
+            self.assertEqual({shortcut.attrib['Id'] for shortcut in shortcuts},
+                             {'StartMenuShortcut'})
+            for shortcut in shortcuts:
+                self.assertEqual(shortcut.attrib['Icon'], icon_node.attrib['Id'])
+                self.assertEqual(shortcut.attrib['IconIndex'], '0')
+                self.assertEqual(shortcut.attrib['Advertise'], 'yes')
             text = wxs.read_text()
             self.assertIn(release.UPGRADE_CODE,text)
             self.assertIn(f'Version="{release.MSI_VERSION}"',text)
@@ -63,9 +141,40 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn('MajorUpgrade',text)
             self.assertNotIn('RemoveFile',text)
             self.assertIn('Cargo.lock',text)
-            self.assertIn('LegacyApplicationProgramsFolder',text)
+            self.assertNotIn('LegacyApplicationProgramsFolder',text)
+            self.assertIn('LegacyRelaunchFolder',text)
+            self.assertIn('OpenWithProgids',text)
             self.assertIn('Name="M4B Editor"',text)
             self.assertIn('Name="m4b-Craft"',text)
+    def test_compiled_msi_wizard(self):
+        wixl = os.environ.get('WIXL', 'wixl')
+        msibuild = os.environ.get('MSIBUILD', 'msibuild')
+        msiinfo = os.environ.get('MSIINFO', 'msiinfo')
+        if not all(shutil.which(tool) for tool in [wixl, msibuild, msiinfo]):
+            self.skipTest('wixl and msitools required for compiled MSI tests')
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            root = Path(d)
+            payload = root/'payload'
+            payload.mkdir()
+            (payload/'m4b-editor.exe').write_bytes(b'fixture')
+            icon = root/release.SHORTCUT_ICON
+            icon.write_bytes(b'fixture')
+            wxs = root/'app.wxs'
+            bridge = root/'bridge.exe'; bridge.write_bytes(b'fixture')
+            release.wix(payload, wxs, icon, bridge)
+            baseline = root/'baseline.msi'
+            subprocess.run([wixl, '-a', 'x64', '-o', str(baseline), str(wxs)], check=True)
+            msi = root/'wizard.msi'
+            release.build_msi(wxs, msi, wixl, msibuild)
+            inspect_wizard(msi)
+            for table in ['InstallExecuteSequence', 'Upgrade', 'Directory', 'Component',
+                          'File', 'Registry', 'RemoveFile', 'Shortcut']:
+                self.assertCountEqual(msi_rows(msi, table), msi_rows(baseline, table), table)
+            original_ui = msi_rows(baseline, 'InstallUISequence')
+            patched_ui = [row for row in msi_rows(msi, 'InstallUISequence')
+                          if not row['Action'].startswith('Wizard')]
+            self.assertCountEqual(patched_ui, original_ui)
+
     def test_signing_binds_payload_and_rejects_tampering(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             path = Path(d)
@@ -186,7 +295,6 @@ class ReleaseTests(unittest.TestCase):
 
     def test_source_pins_match_fetch_and_platform_recipes(self):
         for name, digest in SOURCES.items():
-            if name.startswith('7z'): continue
             for script in ['fetch-media-sources.sh','build-ffmpeg-windows.sh','build-ffmpeg-macos.sh']:
                 text = (ROOT/'scripts'/script).read_text()
                 self.assertIn(name,text)
@@ -199,16 +307,19 @@ class ReleaseTests(unittest.TestCase):
             media = root/'media'; media.mkdir()
             (payload/'licenses/crate').mkdir(parents=True)
             (payload/'licenses/crate/LICENSE').write_text('crate license fixture')
+            (payload/'licenses/crate/LICENSES').mkdir()
+            (payload/'licenses/crate/LICENSES/NOTICE.txt').write_text('nested upstream license')
             for name in ['LICENSE','THIRD-PARTY-NOTICES.txt']:
                 (payload/name).write_text(name)
-            for name in ['COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','COPYING.LAME','LICENSE.7zip','README.7zip']:
+            for name in ['COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','COPYING.LAME']:
                 (media/name).write_text(name)
             output = root/'licenses.zip'; license_sidecar(payload,media,output)
             with zipfile.ZipFile(output) as archive:
                 self.assertIsNone(archive.testzip())
                 self.assertEqual(archive.read('licenses/crate/LICENSE'),b'crate license fixture')
                 self.assertEqual(archive.read('media/COPYING.LAME'),b'COPYING.LAME')
-                self.assertEqual(len(archive.namelist()),9)
+                self.assertEqual(archive.read('licenses/crate/LICENSES/NOTICE.txt'), b'nested upstream license')
+                self.assertEqual(len(archive.namelist()),8)
 
     def test_archive_contains_real_source_bytes(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
@@ -237,15 +348,24 @@ class ReleaseTests(unittest.TestCase):
     def test_media_cache_requires_exact_records_and_pinned_sources(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             media = Path(d)
-            names = ['7zz','LICENSE.7zip','README.7zip','ffmpeg','ffprobe','config.h','config_components.h','config.mak',
-                     'COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','zlib-config.txt','COPYING.LAME','lame-config.txt'] + list(SOURCES)
+            names = ['ffmpeg','ffprobe', *MEDIA_BUILD_FILES, *SOURCES]
             for name in names: (media/name).write_bytes(b'fixture')
             def manifest():
                 (media/'SHA256SUMS').write_text(''.join(sha256(media/name)+'  '+name+'\n' for name in names))
             manifest()
             with self.assertRaisesRegex(ValueError,'Unpinned source'): verify_media(media,'macos-aarch64')
-            with patch.dict(SOURCES,{name:sha256(media/name) for name in SOURCES}), patch.dict(ARCHIVER_MEMBERS['macos-aarch64'],{name:sha256(media/name) for name in ARCHIVER_MEMBERS['macos-aarch64']}):
+            with patch.dict(SOURCES,{name:sha256(media/name) for name in SOURCES}):
                 verify_media(media,'macos-aarch64')
+                legacy = LEGACY_ARCHIVER_SOURCES | LEGACY_ARCHIVER_MEMBERS['macos-aarch64']
+                for name in legacy: (media/name).write_bytes(b'legacy fixture')
+                names.extend(legacy)
+                manifest()
+                with patch.dict(LEGACY_ARCHIVER_SOURCES, {name:sha256(media/name) for name in LEGACY_ARCHIVER_SOURCES}), patch.dict(LEGACY_ARCHIVER_MEMBERS['macos-aarch64'], {name:sha256(media/name) for name in LEGACY_ARCHIVER_MEMBERS['macos-aarch64']}):
+                    verify_media(media,'macos-aarch64')
+                for name in legacy:
+                    names.remove(name)
+                    (media/name).unlink()
+                manifest()
                 (media/'ffmpeg').write_bytes(b'corrupted')
                 with self.assertRaisesRegex(ValueError,'checksum mismatch'): verify_media(media,'macos-aarch64')
                 manifest()
@@ -286,16 +406,119 @@ class ReleaseTests(unittest.TestCase):
             next(directory.glob('*.dmg')).write_bytes(b'changed')
             with self.assertRaisesRegex(ValueError,'Checksum mismatch'): assets.verify(directory,'0.4.0')
 
+def msi_rows(msi, table):
+    tool = os.environ.get('MSIINFO', 'msiinfo')
+    lines = subprocess.check_output([tool, 'export', str(msi), table], encoding='utf-8').splitlines()
+    columns = lines[0].split('\t')
+    return [dict(zip(columns, line.split('\t'), strict=True)) for line in lines[3:]]
+
+
+def inspect_wizard(msi):
+    sequence = {row['Action']: row for row in msi_rows(msi, 'InstallUISequence')}
+    order = {action: int(row['Sequence']) for action, row in sequence.items()}
+    assert order['CostFinalize'] < order['WizardWelcome'] < order['WizardProgress'] < order['ExecuteAction']
+    assert not sequence['ExecuteAction']['Condition']
+    for action, expected in [('WizardComplete', -1), ('WizardCancelled', -2), ('WizardError', -3)]:
+        assert order[action] == expected
+    for action in ['WizardWelcome', 'WizardProgress', 'WizardComplete', 'WizardCancelled', 'WizardError']:
+        assert sequence[action]['Condition'] == (
+            'UILevel = 5 AND NOT Installed AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE AND NOT RESUME')
+    execute = {row['Action']: int(row['Sequence']) for row in msi_rows(msi, 'InstallExecuteSequence')}
+    assert all(not action.startswith('Wizard') for action in execute)
+    assert execute['InstallInitialize'] < execute['RemoveExistingProducts'] < execute['InstallFiles']
+    assert execute['RemoveShortcuts'] < execute['CreateShortcuts'] < execute['InstallFinalize']
+
+    properties = {row['Property']: row['Value'] for row in msi_rows(msi, 'Property')}
+    assert not properties.get('ALLUSERS')
+    assert properties['DefaultUIFont'] == 'WizardBody'
+    directories = {row['Directory']: row for row in msi_rows(msi, 'Directory')}
+    assert directories['INSTALLDIR']['Directory_Parent'] == 'Programs'
+    assert directories['INSTALLDIR']['DefaultDir'].split('|')[-1] == 'M4B Editor'
+    assert directories['LegacyRelaunchFolder']['DefaultDir'].split('|')[-1] == 'm4b-Craft'
+    assert directories['Programs']['Directory_Parent'] == 'LocalAppDataFolder'
+
+    dialogs = {row['Dialog']: row for row in msi_rows(msi, 'Dialog')}
+    assert set(dialogs) == {
+        'WizardWelcome', 'WizardReady', 'WizardProgress', 'WizardConfirmCancel',
+        'WizardComplete', 'WizardCancelled', 'WizardError',
+    }
+    assert not int(dialogs['WizardProgress']['Attributes']) & 2
+    assert dialogs['WizardReady']['Control_Default'] == 'Install'
+    controls = {(row['Dialog_'], row['Control']): row for row in msi_rows(msi, 'Control')}
+    assert controls['WizardReady', 'Destination']['Text'] == '[INSTALLDIR]'
+    assert 'Créez' in controls['WizardWelcome', 'Message']['Text']
+    icon = controls['WizardWelcome', 'AppIcon']
+    assert (icon['Type'], icon['Text']) == ('Icon', 'WizardIcon')
+    tool = os.environ.get('MSIINFO', 'msiinfo')
+    assert subprocess.check_output([tool, 'extract', str(msi), 'Binary.WizardIcon']) == (
+        ROOT/'packaging/icons/app.ico').read_bytes()
+
+    control_events = msi_rows(msi, 'ControlEvent')
+    events = {(row['Dialog_'], row['Control_']): (row['Event'], row['Argument'], row['Condition'])
+              for row in control_events if row['Event'] != 'DoAction'}
+    launch = controls['WizardComplete', 'Launch']
+    assert (launch['Type'], launch['Property'], launch['Text']) == (
+        'CheckBox', 'WizardLaunchEditor', 'Lancer M4B Editor')
+    assert 'WizardLaunchEditor' not in properties
+    assert not dialogs['WizardComplete']['Control_Cancel']
+    assert msi_rows(msi, 'CheckBox') == [{'Property': 'WizardLaunchEditor', 'Value': '1'}]
+    assert [row for row in control_events if row['Event'] == 'DoAction'] == [{
+        'Dialog_': 'WizardComplete', 'Control_': 'Finish', 'Event': 'DoAction',
+        'Argument': 'WizardStartEditor', 'Condition': sequence['WizardComplete']['Condition']
+        + ' AND WizardLaunchEditor = "1"', 'Ordering': '1',
+    }]
+    custom = [row for row in msi_rows(msi, 'CustomAction') if row['Action'] == 'WizardStartEditor']
+    assert len(custom) == 1 and custom[0]['Type'] == '210'
+    assert custom[0]['Source'] == 'EditorExecutable'
+    assert 'WizardStartEditor' not in sequence and 'WizardStartEditor' not in execute
+    assert all(row['Control'] != 'Launch' or row['Dialog_'] == 'WizardComplete'
+               for row in controls.values())
+    components = {row['Component']: row for row in msi_rows(msi, 'Component')}
+    assert components['LegacyRelaunchCraft']['Directory_'] == 'LegacyRelaunchFolder'
+    assert components['LegacyRelaunchEditor']['Directory_'] == 'LegacyRelaunchFolder'
+    assert {row['Shortcut'] for row in msi_rows(msi, 'Shortcut')} == {'StartMenuShortcut'}
+    registry = msi_rows(msi, 'Registry')
+    assert not any('m4b-Craft' in row['Key'] for row in registry)
+    assert any(row['Key'].endswith('M4BEditor.Project\\shell\\open\\command')
+               and row['Value'] == '"[#EditorExecutable]" "%1"' for row in registry)
+    assert events['WizardWelcome', 'Next'] == ('NewDialog', 'WizardReady', '1')
+    assert events['WizardReady', 'Back'] == ('NewDialog', 'WizardWelcome', '1')
+    assert events['WizardReady', 'Install'] == ('EndDialog', 'Return', '1')
+    for name in ['WizardWelcome', 'WizardReady', 'WizardProgress']:
+        assert dialogs[name]['Control_Cancel'] == 'Cancel'
+        assert events[name, 'Cancel'] == ('SpawnDialog', 'WizardConfirmCancel', '1')
+    assert events['WizardConfirmCancel', 'Continue'] == ('EndDialog', 'Return', '1')
+    assert events['WizardConfirmCancel', 'Abort'] == ('EndDialog', 'Exit', '1')
+    for name in ['WizardComplete', 'WizardCancelled', 'WizardError']:
+        assert events[name, 'Finish'] == ('EndDialog', 'Return', '1')
+    assert msi_rows(msi, 'EventMapping') == [
+        {'Dialog_': 'WizardProgress', 'Control_': 'Progress', 'Event': 'SetProgress', 'Attribute': 'Progress'}]
+
+
 def inspect(msi, scratch):
+    inspect_wizard(msi)
     tool = os.environ.get('MSIINFO','msiinfo')
     properties = subprocess.check_output([tool,'export',str(msi),'Property']).decode()
     for value in [release.UPGRADE_CODE.upper(), release.MSI_VERSION]:
         assert value.lower() in properties.lower(),value
     property_rows = dict(row.split('\t', 1) for row in properties.splitlines()[3:] if '\t' in row)
     assert property_rows.get('ProductName') == 'M4B Editor', property_rows.get('ProductName')
+    shortcuts = subprocess.check_output([tool,'export',str(msi),'Shortcut'], text=True).splitlines()
+    columns = shortcuts[0].split('\t')
+    rows = {row['Shortcut']: row for row in
+            (dict(zip(columns, line.split('\t'))) for line in shortcuts[3:])}
+    for name in ['StartMenuShortcut']:
+        assert rows[name]['Icon_'] == release.SHORTCUT_ICON
+        assert rows[name]['IconIndex'] == '0'
+    icon_stream = f'Icon.{release.SHORTCUT_ICON}'
+    with tempfile.TemporaryDirectory(dir=scratch) as d:
+        icon = Path(d)/release.SHORTCUT_ICON
+        icon.write_bytes(subprocess.check_output([tool,'extract',str(msi),icon_stream]))
+        verify_pe_icon(icon)
     files = subprocess.check_output([tool,'export',str(msi),'File']).decode()
-    for name in ['m4b-editor.exe','m4b-editor-cli.exe','ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll','Cargo.lock','LICENSE']:
+    for name in ['m4b-editor.exe','m4b-editor-cli.exe','ffmpeg.exe','ffprobe.exe','Cargo.lock','LICENSE']:
         assert name in files,name
+    assert '7z.exe' not in files and '7z.dll' not in files
     assert '\nALLUSERS\t1' not in properties
     directories = subprocess.check_output([tool,'export',str(msi),'Directory']).decode()
     assert 'LocalAppDataFolder' in directories
@@ -306,18 +529,21 @@ def inspect(msi, scratch):
     assert release.UPGRADE_CODE.lower() in upgrade.lower()
     with zipfile.ZipFile(msi.with_suffix('.zip')) as archive:
         assert archive.testzip() is None
-        for name in ['m4b-editor.exe','m4b-editor-cli.exe','ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll','source/crates/desktop/src/updater.rs','source/Cargo.lock']:
+        for name in ['m4b-editor.exe','m4b-editor-cli.exe','ffmpeg.exe','ffprobe.exe','source/crates/desktop/src/updater.rs','source/Cargo.lock']:
             assert name in archive.namelist(),name
-        assert not any(name.lower().endswith(('.pem','.key')) for name in archive.namelist())
+        assert not any(name.lower().endswith(('.pem','.key','7z.exe','7z.dll','license.7zip')) for name in archive.namelist())
     sidecar = msi.with_name(msi.stem+'-media-sources.zip')
     with zipfile.ZipFile(sidecar) as archive:
         assert archive.testzip() is None
+        assert set(archive.namelist()) == set(SOURCES)
         for name, digest in SOURCES.items():
             assert hashlib.sha256(archive.read(name)).hexdigest() == digest
     with tempfile.TemporaryDirectory(dir=scratch) as d:
         subprocess.run([os.environ.get('MSIEXTRACT','msiextract'),'-C',d,str(msi)],check=True,stdout=subprocess.DEVNULL)
         for path in Path(d).rglob('m4b-editor.exe'):
-            assert path.read_bytes().startswith(b'MZ')
+            if path.parent.name == 'm4b-Craft':
+                continue
+            verify_pe_icon(path)
             assert (path.parent/'source/crates/desktop/src/updater.rs').exists()
             assert (path.parent/'ffprobe.exe').exists()
             break

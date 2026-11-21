@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import wave
 import zipfile
-from release_common import SOURCES, VERSION
+from release_common import ROOT, SOURCES, VERSION
 
 spec = importlib.util.spec_from_file_location('verify',Path(__file__).with_name('verify-macos.py'))
 verify = importlib.util.module_from_spec(spec); spec.loader.exec_module(verify)
@@ -42,6 +42,8 @@ def main():
             assert info['CFBundleShortVersionString'] == VERSION.split('-')[0]
             assert info['UTExportedTypeDeclarations'][0]['UTTypeTagSpecification']['public.filename-extension'] == ['m4bproj']
             resources = source/'Contents/Resources'
+            assert info['CFBundleIconFile'] == 'app.icns'
+            assert (resources/info['CFBundleIconFile']).read_bytes() == (ROOT/'packaging/icons/app.icns').read_bytes()
             for required in ['LICENSE','THIRD-PARTY-NOTICES.txt','MEDIA-SOURCES.txt',
                              'source/Cargo.toml','source/Cargo.lock','source/scripts/build-ffmpeg-macos.sh',
                              'source/third-party/ffmpeg/COPYING.LGPLv2.1',
@@ -59,19 +61,18 @@ def main():
             run('hdiutil','detach',mount)
         run('codesign','--verify','--deep','--strict',installed)
         binaries = installed/'Contents/MacOS'
-        for name in ['m4b-editor','m4b-editor-cli','ffmpeg','ffprobe','7zz']: verify.verify(binaries/name)
-        fixture = install/'archive test.zip'
-        with zipfile.ZipFile(fixture,'w') as archive:
-            archive.writestr('synthetic.txt',b'offline bundled archiver fixture')
-        unpacked = install/'archive output'
-        run(binaries/'7zz','x','-y','-o'+str(unpacked),fixture)
-        assert (unpacked/'synthetic.txt').read_bytes() == b'offline bundled archiver fixture'
-
+        for name in ['m4b-editor','m4b-editor-cli','ffmpeg','ffprobe']: verify.verify(binaries/name)
+        assert not (binaries/'7zz').exists()
         # A system-only PATH proves installed CLI finds its adjacent media tools.
         env = dict(os.environ,PATH='/usr/bin:/bin:/usr/sbin:/sbin')
         cli = binaries/'m4b-editor-cli'
         version = subprocess.check_output([str(cli),'--version'],text=True,env=env)
         assert VERSION in version
+        for fixture in ['audio.zip', 'audio.rar']:
+            archived_project = work/(fixture + '.m4bproj')
+            run(cli,'new','--project',archived_project,ROOT/'tests/fixtures'/fixture,env=env)
+            assert len(json.loads(archived_project.read_text())['tracks']) == 1
+
         track = work/'PCM é sample.wav'
         with wave.open(str(track),'wb') as output:
             output.setparams((1,2,44100,0,'NONE','not compressed'))

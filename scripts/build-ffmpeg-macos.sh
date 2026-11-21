@@ -50,5 +50,3 @@ cp "$source_archive" "$out/ffmpeg-8.0.1.tar.xz"
 cp "$zlib_archive" "$out/zlib-1.3.1.tar.gz"
 (cd "$out" && shasum -a 256 ffmpeg ffprobe ffmpeg-8.0.1.tar.xz zlib-1.3.1.tar.gz config.h config_components.h config.mak COPYING.LGPLv2.1 LICENSE.md LICENSE.zlib zlib-config.txt lame-3.100.tar.gz COPYING.LAME lame-config.txt > SHA256SUMS)
 python3 "$root/scripts/verify-macos.py" "$out/ffmpeg" "$out/ffprobe"
-
-python3 "$root/scripts/bundle-archiver.py" --archives "$(dirname "$source_archive")" --media "$out" --platform macos-aarch64

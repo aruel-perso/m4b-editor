@@ -15,7 +15,7 @@ import tempfile
 import wave
 import zipfile
 import zlib
-from release_common import VERSION, SOURCES
+from release_common import ROOT, VERSION, SOURCES
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
         cwd = temp / 'unrelated directory été'
         cwd.mkdir()
         # Poison CWD: runtime must locate its packaged tools by executable directory.
-        for name in ['ffmpeg.exe', 'ffprobe.exe', '7z.exe', '7z.dll']:
+        for name in ['ffmpeg.exe', 'ffprobe.exe']:
             (cwd / name).write_bytes(b'not an executable')
         def win(path):
             return 'Z:' + str(path.resolve()).replace('/', '\\')
@@ -89,12 +89,11 @@ def main():
         assert len(pcm.stdout) > 96000 and any(pcm.stdout)
         print('PASS bundled Windows tools: natural-order WAV import -> AAC M4B + PNG cover + chapters -> probe -> non-silent preview PCM at seek position')
         print('PASS unrelated Unicode CWD with poisoned FFmpeg names; no WINEPATH media tools; originals and existing output preserved')
-        fixture = temp/'archive test.zip'
-        with zipfile.ZipFile(fixture,'w') as archive:
-            archive.writestr('synthetic.txt',b'offline bundled archiver fixture')
-        unpacked = temp/'archive output'
-        run(package/'7z.exe','x','-y','-o'+win(unpacked),win(fixture))
-        assert (unpacked/'synthetic.txt').read_bytes() == b'offline bundled archiver fixture'
+        assert not any((package/name).exists() for name in ['7z.exe', '7z.dll'])
+        for fixture in ['audio.zip', 'audio.rar']:
+            imported = temp/(fixture + '.m4bproj')
+            run(cli, 'new', '--project', win(imported), win(ROOT/'tests/fixtures'/fixture))
+            assert len(json.loads(imported.read_text())['tracks']) == 1
         # Actual application binary sources and media sources must be included.
         assert (package / 'source/crates/desktop/src/playback.rs').is_file()
         sources_path = args.archive.with_name(args.archive.stem + '-media-sources.zip')

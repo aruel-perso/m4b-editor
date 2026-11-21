@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate redistributable synthetic fixtures; --long opts into a 1h WAV.
-No downloads. FFmpeg and 7z versions are recorded; exact hashes describe the
+No downloads. FFmpeg and native ZIP versions are recorded; exact hashes describe the
 checked-in corpus, while audio comparisons use explicit duration tolerances.
 """
 import argparse
@@ -8,8 +8,6 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import shutil
-import sys
 import struct
 import subprocess
 import wave
@@ -33,7 +31,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--long", action="store_true")
     parser.add_argument("--check", action="store_true", help="Verify the frozen corpus hashes without regenerating encodings")
-    parser.add_argument("--regenerate-encrypted", action="store_true", help="Replace encrypted fixtures (7z uses random salts, so hashes change)")
+    parser.add_argument("--regenerate-encrypted", action="store_true", help="Replace the encrypted ZIP fixture (random salt changes the hash)")
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     if args.check:
@@ -42,9 +40,6 @@ def main():
             assert hashlib.sha256((OUT / entry["path"]).read_bytes()).hexdigest() == entry["sha256"], entry["path"]
         print(f"Verified {len(manifest['files'])} fixture hashes")
         return
-    archiver = next((str(p) for name in ("7z.exe", "7zz.exe", "7z", "7zz") for p in [Path(sys.executable).resolve().parent / name] if p.is_file()), None) or shutil.which("7z") or shutil.which("7zz")
-    if not archiver:
-        parser.error("Fixture generation requires 7z or 7zz beside Python or on PATH")
     wav(OUT / "tone440.wav", 440)
     wav(OUT / "tone880.wav", 880, 16000)
     wav(OUT / "silence.wav", 0)
@@ -66,16 +61,10 @@ def main():
     with zipfile.ZipFile(OUT / "zip64.zip", "w") as archive:
         with archive.open(zipfile.ZipInfo("tone440.wav", (2000,1,1,0,0,0)), "w", force_zip64=True) as entry:
             entry.write((OUT / "tone440.wav").read_bytes())
-    # Password is public test data, never a user's secret. No password in argv.
-    # 7z creation requires -pPASSWORD; fixture creation uses a public fixed value.
-    for name, extra in [("audio.7z", []), ("encrypted.7z", ["-pfixture", "-mhe=on"]), ("encrypted.zip", ["-pfixture", "-tzip"])]:
-        path = OUT / name
-        if "encrypted" in name and path.exists() and not args.regenerate_encrypted:
-            continue  # Preserve frozen cryptographic salts; generation is semantically reproducible.
-        path.unlink(missing_ok=True)
-        run(archiver, "a", "-bd", "-y", "-mtc=off", "-mtm=off", "-mta=off", *extra, str(path), str(OUT / "tone440.wav"))
-    # A genuine RAR 2.x stored member: signature, CRC-protected main/file/end
-    # headers and unchanged WAV payload. Validated with `7z t`, not a fake listing.
+    if args.regenerate_encrypted or not (OUT / "encrypted.zip").exists():
+        subprocess.run(["cargo", "run", "--locked", "-p", "m4b-editor-core",
+                        "--example", "encrypted_fixture"], cwd=ROOT, check=True)
+    # A stored RAR 2.x member with CRC-protected headers and a synthetic WAV.
     def rar_header(kind, flags, body):
         data = struct.pack("<BHH", kind, flags, 7 + len(body)) + body
         return struct.pack("<H", zlib.crc32(data) & 65535) + data
@@ -84,7 +73,6 @@ def main():
     rar = b"Rar!\x1a\x07\x00" + rar_header(0x73, 0, b"\0" * 6)
     rar += rar_header(0x74, 0x8000, struct.pack("<IIBIIBBHI", len(data), len(data), 3, zlib.crc32(data), 0x28210000, 20, 0x30, len(name), 0o100644) + name)
     (OUT / "audio.rar").write_bytes(rar + data + rar_header(0x7b, 0, b""))
-    run(archiver, "t", str(OUT / "audio.rar"))
     with zipfile.ZipFile(OUT / "hostile-traversal.zip", "w") as archive:
         archive.writestr(zipfile.ZipInfo("../escape.wav", (2000,1,1,0,0,0)), data)
     (OUT / "corrupt.zip").write_bytes(b"PK invalid")
@@ -92,21 +80,21 @@ def main():
     (OUT / "legacy.json").write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n")
     project["chapters"][1]["start_ms"] = 9999
     (OUT / "invalid-chapters.m4bproj").write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n")
-    manifest = {"provenance": "Generated mathematical tones and red pixels; CC0-1.0 dedication by project contributors", "password": "fixture (public test data)", "tools": {"ffmpeg": subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0], "7z": subprocess.check_output([archiver], text=True).splitlines()[1]}, "files": []}
+    manifest = {"provenance": "Generated mathematical tones and red pixels; CC0-1.0 dedication by project contributors", "password": "fixture (public test data)", "tools": {"ffmpeg": subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0], "zip": "Rust zip 9.8.1 (AES fixture)"}, "files": []}
     for path in sorted(OUT.iterdir()):
         if path.name in ["manifest.json", "long-opt-in.wav"]:
             continue
         properties = {"expected": "reject as corrupt image"} if path.name == "corrupt.png" else {"expected": "reject hostile/corrupt archive" if path.name in ["corrupt.zip", "hostile-traversal.zip", "invalid-chapters.m4bproj"] else "valid synthetic input"}
         if path.suffix in [".wav", ".m4b", ".mka", ".flac"]:
             properties.update(duration_ms=10 if path.name == "very-short.wav" else 250, duration_tolerance_ms=150 if path.suffix == ".m4b" else 2, audio_streams=2 if path.suffix == ".mka" else 1)
-        if path.suffix in [".zip", ".7z", ".rar"]:
+        if path.suffix in [".zip", ".rar"]:
             properties.update(container=path.suffix[1:], encrypted=path.name.startswith("encrypted"), member_count=1)
         if path.suffix in [".png", ".jpg", ".ppm"] and not path.name.startswith("corrupt"):
             properties.update(width=2, height=2)
         manifest["files"].append({"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), **properties})
     original_mp3 = ROOT / "crates/core/tests/fixtures/one-second-tone.mp3"
     manifest["files"].append({"path": "../../crates/core/tests/fixtures/one-second-tone.mp3", "sha256": hashlib.sha256(original_mp3.read_bytes()).hexdigest(), "expected": "existing synthetic MP3 preserved", "duration_ms": 1000, "duration_tolerance_ms": 150})
-    manifest["reproduction"] = "Python standard library for WAV/ZIP/RAR/project; FFmpeg bitexact modes for media. Exact hashes pin the corpus; encoder version differences use property tolerances. Encrypted 7z/ZIP use random salts and are retained unless --regenerate-encrypted. Public password: fixture."
+    manifest["reproduction"] = "Python standard library for WAV/ZIP/RAR/project; FFmpeg bitexact modes for media. Exact hashes pin the corpus; encoder version differences use property tolerances. The AES ZIP uses a random salt and is retained unless --regenerate-encrypted. Public password: fixture."
     (OUT / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     if args.long:
         wav(OUT / "long-opt-in.wav", 440, seconds=3600)

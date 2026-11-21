@@ -5,7 +5,7 @@ Ouvrir le MSI pour une installation par utilisateur avec raccourci Demarrer.
 Alternative portable : extraire TOUT le ZIP et lancer m4b-editor.exe ou le .cmd.
 FFmpeg et ffprobe sont fournis a cote des executables ; ne pas les separer.
 Aucune installation multimedia ni modification de PATH n'est requise.
-7z.exe et 7z.dll officiels sont inclus pour RAR/7Z hors ligne.
+L’extraction ZIP et RAR fonctionne hors ligne.
 Conserver projets et actifs hors du dossier d'installation. Transporter tout
 le dossier projet avec ses actifs ; verifier les anciens chemins absolus.
 Pour un lecteur, utiliser le M4B exporte. Garder une sauvegarde.
@@ -21,7 +21,7 @@ EN
 Open the MSI for per-user installation with a Start menu shortcut.
 Portable alternative: extract the ENTIRE ZIP and launch m4b-editor.exe or .cmd.
 Keep bundled ffmpeg/ffprobe beside the application. No media installation or
-PATH change is required. Official 7z.exe and 7z.dll are bundled for offline RAR/7Z extraction.
+PATH change is required. ZIP and RAR import work offline.
 Keep projects/assets outside the install directory; transport the whole project
 folder and verify older absolute source paths. Use exported M4B for players.
 Keep backups. Export refuses overwrite, requires hard-link support (normally

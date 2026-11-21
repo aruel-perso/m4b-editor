@@ -1,6 +1,6 @@
 M4B Editor — AppleSilicon ARM64 only
 Drag M4B Editor.app to Applications, then eject this disk image.
-The bundle contains the GUI, m4b-editor-cli, ffmpeg, ffprobe and native ARM64 7zz in Contents/MacOS.
+The bundle contains the GUI, m4b-editor-cli, ffmpeg and ffprobe in Contents/MacOS.
 No Homebrew runtime installation is required.
 This release has ad-hoc code signatures only: no Developer ID or notarization.
 Gatekeeper can block downloaded builds. Only open a build whose origin you trust;

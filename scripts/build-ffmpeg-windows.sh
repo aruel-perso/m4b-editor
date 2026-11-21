@@ -48,5 +48,3 @@ cp "$zlib/LICENSE" "$out/LICENSE.zlib"
 printf '%s\n' 'make -j1 -f win32/Makefile.gcc PREFIX=x86_64-w64-mingw32- libz.a' > "$out/zlib-config.txt"
 (cd "$out" && sha256sum ffmpeg.exe ffprobe.exe ffmpeg-8.0.1.tar.xz zlib-1.3.1.tar.gz config.h config_components.h config.mak COPYING.LGPLv2.1 LICENSE.md LICENSE.zlib zlib-config.txt lame-3.100.tar.gz COPYING.LAME lame-config.txt > SHA256SUMS)
 printf 'Built bundled Windows media tools in %s\n' "$out"
-
-python3 "$root/scripts/bundle-archiver.py" --archives "$(dirname "$source_archive")" --media "$out" --platform windows-x86_64

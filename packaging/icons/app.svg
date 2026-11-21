@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>M4B Editor — audiobook and pencil</title>
+  <rect x="4" y="4" width="120" height="120" rx="25" fill="#17263e"/>
+  <path d="M24 66V55a31 31 0 0 1 62 0v8" fill="none" stroke="#57d8cc" stroke-width="8"/>
+  <rect x="18" y="56" width="14" height="25" rx="5" fill="#57d8cc"/>
+  <rect x="78" y="56" width="14" height="25" rx="5" fill="#57d8cc"/>
+  <path d="M55 62c-8-6-17-7-25-5v35c9-2 18-1 25 5 7-6 16-7 25-5V57c-8-2-17-1-25 5Z" fill="#f6f6ed"/>
+  <path d="M55 65v27" stroke="#8b9aad" stroke-width="5" stroke-linecap="round"/>
+  <path d="m63 107 4-20 35-35a6 6 0 0 1 8 0l9 9a6 6 0 0 1 0 8l-35 35Z" fill="#ffbf55" stroke="#17263e" stroke-width="6" stroke-linejoin="round"/>
+  <path d="m97 58 16 16M68 88l15 15" stroke="#17263e" stroke-width="4"/>
+</svg>
