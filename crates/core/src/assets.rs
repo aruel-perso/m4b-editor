@@ -399,6 +399,17 @@ mod archive_tests {
             Some(ImportEvent::ComparingCovers { done: 2, total: 2 })
         ));
 
+        let manual_cover = temp.path().join("cover.ppm");
+        let mut manual = Project {
+            cover: Some(manual_cover.clone()),
+            ..Project::default()
+        };
+        manual
+            .import_assets(&backend, vec![input.clone()], &assets)
+            .unwrap();
+        assert_eq!(manual.cover.as_ref(), Some(&manual_cover));
+        manual.validate().unwrap();
+
         project.chapters[0].title = "Edited chapter".into();
         let previous_cover = project.cover.clone();
         archive(
@@ -433,6 +444,38 @@ mod archive_tests {
             .is_err());
         assert!(cancelled.tracks.is_empty());
         assert_eq!(fs::read_dir(&assets).unwrap().count(), before);
+
+        let bare_track = temp.path().join("bare.mp3");
+        assert!(command(&backend.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(temp.path().join("track2.mp3"))
+            .args(["-map", "0:a", "-c:a", "copy"])
+            .arg(&bare_track)
+            .status()
+            .unwrap()
+            .success());
+        let bare = fs::read(bare_track).unwrap();
+        let input = temp.path().join("bare.zip");
+        archive(
+            &input,
+            &[
+                ("part1.mp3", &bare, 0o100644),
+                ("part2.mp3", &bare, 0o100644),
+            ],
+        );
+        let mut uncovered = Project::default();
+        uncovered
+            .import_assets(&backend, vec![input.clone()], &assets)
+            .unwrap();
+        assert!(uncovered.cover.is_none());
+
+        archive(
+            &input,
+            &[("part1.mp3", &bare, 0o100644), ("part2.mp3", &a, 0o100644)],
+        );
+        let mut mixed = Project::default();
+        mixed.import_assets(&backend, vec![input], &assets).unwrap();
+        assert_eq!(mixed.cover.as_ref(), Some(&mixed.tracks[1].path));
     }
 
     #[test]

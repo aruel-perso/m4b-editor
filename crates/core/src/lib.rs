@@ -897,6 +897,7 @@ impl MediaBackend for DesktopFfmpeg {
             .iter()
             .find(|stream| stream["disposition"]["attached_pic"] == 1)?["index"]
             .as_u64()?;
+        // Bundled FFmpeg provides the image2 muxer. Treat the pipe as a single output.
         let output = jobs::capture(
             command(&self.ffmpeg)
                 .args(["-v", "error", "-max_alloc", "67108864", "-i"])
@@ -909,7 +910,9 @@ impl MediaBackend for DesktopFfmpeg {
                     "-frames:v",
                     "1",
                     "-f",
-                    "image2pipe",
+                    "image2",
+                    "-update",
+                    "1",
                     "pipe:1",
                 ]),
             job,
