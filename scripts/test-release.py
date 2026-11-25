@@ -31,6 +31,20 @@ def verify_pe_icon(path):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_linux_runtime_dependencies_include_dynamically_loaded_xkb(self):
+        spec = importlib.util.spec_from_file_location('linux_package', ROOT/'scripts/package-linux.py')
+        assert spec is not None and spec.loader is not None
+        linux = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(linux)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            work = Path(d)
+            payload = work/'payload'
+            payload.mkdir()
+            with patch.object(linux.subprocess, 'check_output', return_value='shlibs:Depends=libc6 (>= 2.39)\n'):
+                depends = linux.dependencies(work, payload)
+            self.assertIn('libc6 (>= 2.39)', depends)
+            self.assertIn('libxkbcommon-x11-0', depends.split(', '))
+
     def test_windows_shortcut_icon_pe(self):
         for tool in ['windres', 'gcc', 'objdump']:
             if not shutil.which(f'x86_64-w64-mingw32-{tool}'):

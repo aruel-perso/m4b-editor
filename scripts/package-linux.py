@@ -29,7 +29,7 @@ def dependencies(work, payload):
     depends = result.strip().removeprefix('shlibs:Depends=')
     # The display backends load these providers at runtime rather than linking to them.
     desktop_runtime = (
-        'libegl1', 'libgl1', 'libwayland-client0', 'libxkbcommon0',
+        'libegl1', 'libgl1', 'libwayland-client0', 'libxkbcommon0', 'libxkbcommon-x11-0',
         'libx11-6', 'libx11-xcb1', 'libxcursor1', 'libxi6', 'libxrandr2',
         'xdg-desktop-portal', 'xdg-utils',
     )
