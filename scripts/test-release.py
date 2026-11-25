@@ -102,6 +102,20 @@ class ReleaseTests(unittest.TestCase):
             self.assertFalse((out/'licenses/fixture-1.0.0/README.md').exists())
             self.assertIn('fixture 1.0.0: MIT', (out/'THIRD-PARTY-NOTICES.txt').read_text())
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX payload permission regression')
+    def test_media_sources_remain_readable_after_root_owned_install(self):
+        from release_common import copy_media_sources
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            root = Path(d)
+            media = root/'media'; media.mkdir()
+            for name in (*MEDIA_BUILD_FILES, *SOURCES):
+                file = media/name
+                file.write_bytes(b'synthetic source fixture')
+                file.chmod(0o600)
+            source = copy_media_sources(media, root/'source')
+            for file in source.iterdir():
+                self.assertEqual(file.stat().st_mode & 0o777, 0o644, file.name)
+
     def test_source_copy_excludes_private_notes_and_includes_tests(self):
         from release_common import copy_source
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:

@@ -90,7 +90,11 @@ def copy_media_sources(media, source_directory):
     destination = source_directory/'third-party/ffmpeg'
     destination.mkdir(parents=True)
     for name in (*MEDIA_BUILD_FILES, *SOURCES):
-        shutil.copy2(media/name, destination/name)
+        target = destination/name
+        shutil.copy2(media/name, target)
+        # Verified downloads can be mode 0600. Root-owned installations must
+        # expose corresponding sources/licenses to ordinary application users.
+        target.chmod(0o644)
     return destination
 
 def verify_source_archives(directory):
