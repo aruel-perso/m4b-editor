@@ -1,32 +1,45 @@
 # M4B Editor release procedure
 
-Merge the code and Cargo version before building. The 0.4.1 candidate uses
-a new MSI product version for major upgrades from 0.4.0. The canonical repository is `aruel-perso/m4b-editor`.
-No publication or repository rename is performed by the local tooling.
+Branch CI builds and tests packages for the reviewed Cargo version. Publishing
+requires separate approval to create the version tag on the canonical repository,
+`aruel-perso/m4b-editor`, and access to the protected release environment.
 
 ## Build and review
 
-Run the checks in [testing.md](testing.md). Fetch pinned media sources,
-build platform media caches, then run `package-release.py` on the Windows GNU
-build host and `package-macos.py` on native Mac ARM64. New assets start with
-`M4B-Editor-VERSION-PLATFORM`. The app is `M4B Editor.app`, with
-`Contents/MacOS/m4b-editor` and adjacent `m4b-editor-cli`, ffmpeg and ffprobe.
-Windows installs `m4b-editor.exe` and `m4b-editor-cli.exe` with adjacent media tools.
-Media source and license ZIP sidecars, application source, generated media configuration and license
-notices are mandatory. Do not distribute private planning/session notes.
+| Target | Installer | Portable |
+| --- | --- | --- |
+| Windows x86_64 | MSI | ZIP |
+| macOS ARM64 | DMG | ZIP |
+| Linux x86_64 | DEB | ZIP |
 
-Collect only installer/portable/source ZIP assets and SHA-256 sidecars in a flat
-directory; run `verify-release-assets.py DIRECTORY --version VERSION` before signing.
-Run it again with `--signed` afterward; use `--legacy --signed` for the old channel.
-Keep generated MSI payload/WiX inspection files outside that upload directory.
-The workflow uploads explicit extensions and validates the exact asset set.
+Run the checks in [testing.md](testing.md). Fetch pinned media sources, build
+the per-platform media cache and run `package-release.py` on the Windows
+GNU cross-build host, `package-macos.py` on native ARM64 macOS, and
+`package-linux.py` on Ubuntu 24.04 x86_64. Linux ZIP users need the same
+runtime dependencies as the DEB. The media tools are adjacent to the GUI and
+CLI in every package. The macOS executables live under `Contents/MacOS`;
+the Linux DEB payload lives under `/usr/lib/m4b-editor`.
+
+Each installer and portable ZIP includes the application's source, license
+notices, FFmpeg/zlib/LAME archives with their pinned hashes, and generated
+media build configuration. The macOS bundle stores these under
+`Contents/Resources`. Keep private media and planning notes outside the
+source payload.
+
+Collect the six installer and portable files and their SHA-256 sidecars in a
+flat CI staging directory. Run `verify-release-assets.py DIRECTORY --version
+VERSION` before signing and again with `--signed` afterward. Keep generated
+MSI payload/WiX inspection files and legacy compatibility assets outside this
+directory. The release attaches the six packages and the technical
+`update-v2-PLATFORM.json` manifests. SHA-256 hashes appear in the release
+notes and in the CI staging artifacts.
 
 Sign with `sign-update.py --key EXTERNAL.pem --installer FILE --version VERSION
 --platform PLATFORM --out update-v2-PLATFORM.json --scratch DIRECTORY`.
-The signer derives the public key and rejects anything other than the original
-pinned Ed25519 key. Never rotate the key to get a release through. Installer
-filenames, version, size, digest, platform and exact canonical GitHub URL are
-bound by the signature. SHA-256 sidecars alone do not authenticate updates.
+The signer requires the original pinned Ed25519 key and binds the installer
+filename, version, size, digest, platform and canonical GitHub URL. The
+Windows and macOS updaters consume their respective manifests. Linux users
+install updates manually and can verify the signed DEB manifest.
 
 ## Legacy 0.3 channel: explicit rebrand exceptions
 
@@ -60,13 +73,15 @@ the canonical DMG: its internal layout is incompatible with the old helper.
 
 Run `prepare-legacy-release.py --canonical CANONICAL-DIR --legacy-dmg FILE
 --out EMPTY-DIR --version VERSION`. This copies the Windows payload under its old
-filename and the separately built Mac image plus source sidecars and checksums.
+filename and the separately built Mac image. It reconstructs the Windows
+compatibility sidecars from the canonical ZIP and copies the Mac sidecars
+from the legacy build.
 Sign each legacy installer with `sign-update.py --legacy` and the same external
 key, writing `update-PLATFORM.json`. The signed URLs point strictly to
 `https://github.com/aruel-perso/m4b-craft/releases/download/vVERSION/m4b-Craft-VERSION-windows-x86_64.msi`
 and the corresponding `m4b-Craft-VERSION-macos-aarch64.dmg` URL.
 The compatibility repository must serve the actual files and manifests without
-redirection. Copy GPL source/license sidecars with both channels. Publish only
+redirection. Include the source/license sidecars on the legacy channel. Publish only
 after the reviewer checks exact filenames, hashes, signatures and native tests.
 No live native Mac upgrade has been verified by this packaging work.
 
@@ -74,9 +89,9 @@ No live native Mac upgrade has been verified by this packaging work.
 
 Hosted Windows and native ARM64 Mac builds exercise the bundled FFmpeg codecs
 and native ZIP/RAR import, including password paths in the workspace tests. Both canonical and compatibility DMGs are mounted and
-their installed CLI is exercised. Historical 0.4.0 MSI acceptance included a Wine upgrade from 0.3, actual
-AAC/MP3/FLAC exports, portable-copy and data-preserving uninstall. The 0.4.1
-candidate requires its own installed upgrade and uninstall acceptance.
+their installed CLI is exercised. CI installs the Linux DEB and exercises the
+bundled CLI and media tools from both the installed and portable layouts. Historical 0.4.0 MSI acceptance included a Wine upgrade from 0.3, actual
+AAC/MP3/FLAC exports, portable-copy and data-preserving uninstall. Each release candidate requires its own installed upgrade and uninstall acceptance.
 Wine is not native Windows certification. Physical GUI, audible playback and
 live in-app replacement remain unverified; ad hoc Mac sealing is not Developer
 ID/notarization. Real release-key signing is mandatory at publication.

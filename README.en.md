@@ -3,15 +3,16 @@
 [Français](README.md) · English
 
 Desktop audiobook editor with French/English UI and a CLI sharing the Rust core.
-Current development candidate: **0.4.1**.
+Current development candidate: **0.4.2**.
 
 [Official downloads](https://github.com/aruel-perso/m4b-editor/releases)
 
-Choose the Windows x86_64 MSI or macOS Apple Silicon ARM64 DMG. Retain the
-corresponding source archives and checksum sidecars. Windows installs the app
-and media tools together; extract the entire portable ZIP. On Mac, copy
-**M4B Editor.app** into Applications. FFmpeg/ffprobe are bundled; no PATH changes
-are needed. Publisher signing and notarization are outside this release scope.
+Choose the MSI for Windows x86_64, DMG for macOS ARM64 or DEB for Linux
+x86_64 (Ubuntu 24.04 or compatible). Each platform also has a portable ZIP.
+Extract the whole ZIP and keep the media tools beside the app. On macOS,
+you can copy `M4B Editor.app` into Applications. Each package contains the
+corresponding sources and license notices. SHA-256 hashes are in the release
+notes.
 
 Create or open a `.m4bproj`, add tracks, edit ordering, chapters, metadata and
 cover, then export the book. Legacy `.json` projects remain compatibility formats;

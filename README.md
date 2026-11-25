@@ -3,16 +3,16 @@
 Français · [English](README.en.md)
 
 Éditeur de livres audio de bureau, avec interface FR/EN et CLI partageant le
-même cœur Rust. Version de développement : **0.4.1**.
+même cœur Rust. Version de développement : **0.4.2**.
 
 [Téléchargements officiels](https://github.com/aruel-perso/m4b-editor/releases)
 
-Utilisez le MSI Windows x86_64 ou le DMG macOS Apple Silicon ARM64 correspondant
-à votre système. Conservez les archives de sources et les empreintes associées.
-Sous Windows, l'application et ses outils multimédias sont installés ensemble ;
-le ZIP portable doit être extrait entièrement. Sous Mac, copiez **M4B Editor.app**
-dans Applications. Les outils FFmpeg/ffprobe sont inclus ; aucune modification du
-PATH n'est requise. La signature éditeur et la notarisation ne sont pas incluses.
+Utilisez le MSI pour Windows x86_64, le DMG pour macOS ARM64 ou le DEB pour
+Linux x86_64 (Ubuntu 24.04 ou compatible). Chaque plateforme propose aussi un
+ZIP portable. Extrayez le ZIP en entier et gardez les outils multimédias avec
+l’application. Sous macOS, vous pouvez copier `M4B Editor.app` dans Applications.
+Chaque paquet contient les sources correspondantes et les licences. Les
+empreintes SHA-256 figurent dans les notes de version.
 
 Créez ou ouvrez un projet `.m4bproj`, ajoutez les pistes, réglez l'ordre, les
 chapitres, les métadonnées et la couverture, puis exportez le livre. Les anciens

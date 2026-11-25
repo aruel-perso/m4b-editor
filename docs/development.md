@@ -35,15 +35,16 @@ work offline. The source fetch regression suite uses local transport fixtures.
 
 Pass all three archives, in that order, to `build-ffmpeg-windows.sh` or
 `build-ffmpeg-macos.sh`. Windows requires the GNU cross toolchain; Mac requires
-native ARM64 clang. LAME is built statically without its frontend, then linked
+native ARM64 clang. Linux x86_64 runs `build-ffmpeg-unix.sh linux` with the
+same three archives and native GCC. LAME is built statically without its frontend, then linked
 into FFmpeg as libmp3lame. The build enables AAC, MP3 and FLAC encoders and the
 matching MP4, MP3 and FLAC muxers. Capability claims require actual packaged-tool
 encoding tests. FFmpeg networking and automatic library discovery are disabled.
 
 Installers contain application source, build recipes, media configuration,
-Rust license notices and media licenses. Each platform's media-sources ZIP
-contains the exact pinned upstream archives. Retain these sidecars with each
-release so static-library modifications can be rebuilt with the supplied recipe.
+Rust license notices, media licenses and the exact pinned upstream archives
+under `source/third-party/ffmpeg/`. The portable ZIPs carry the same materials
+so static-library modifications can be rebuilt with the supplied recipes.
 
 ## Native archive import
 
@@ -51,7 +52,7 @@ The core uses `zip 9.8.1` (MIT) with stored/deflate, ZipCrypto and AES support,
 and `rar-rs 0.15.3` for single-volume RAR. RAR's original code uses BSD-2-Clause.
 The upstream `NOTICE` and `THIRD_PARTY_LICENSES.md` credit `rars` ports under MIT
 or Apache-2.0 and the BSD-2-Clause libarchive RAR5 reference. Installers and
-license sidecars carry those notices and the `LICENSES` directory.
+portable ZIPs carry those notices and the `LICENSES` directory.
 
 RAR preflight accepts RAR5/RAR7 containers and legacy RAR 1.5–4.x containers
 with clear headers. RAR5 header and member encryption are supported within the
@@ -92,7 +93,7 @@ bypass the presentation wizard.
 
 With `wixl` and msitools available, `test-release.py --scratch DIRECTORY`
 builds a small MSI and checks its wizard tables against the compiled package
-without the UI import. Add `--msi FILE` to inspect the release MSI and sidecars.
+without the UI import. Add `--msi FILE` to inspect the release MSI and portable ZIP.
 For a Windows smoke test, run the MSI interactively, repeat with an older
 version installed using a disposable Windows account, and check install and
 uninstall with `msiexec /i FILE /qn`, `msiexec /i FILE /passive` and

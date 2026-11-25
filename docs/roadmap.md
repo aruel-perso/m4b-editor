@@ -197,3 +197,66 @@ download completion. The Windows helper rechecks the staged installer hash
 after the running app exits. Signed live replacement and relaunch require
 native Windows acceptance with the exact release asset and matching channel.
 Portable single-EXE remains deferred.
+
+## 0.4.2 — approved development and GitHub CI
+
+The user approved this scope, implementation, push and GitHub CI. The changes
+below are implemented locally; hosted packaging and target-platform acceptance
+remain to be verified. No release tag or public release is authorized.
+The reported export failure is also in scope: the private 0.4.1 Windows log
+records FFmpeg exit -12 during encoding at 63.89%. Synthetic tests reproduce
+MOV packet-index allocation failure and exercise bounded mux/demux budgets;
+the redacted original stderr does not independently prove the incident's cause.
+
+- Provide a `log/` directory containing persistent execution logs for debugging
+  on Windows, macOS and Linux. Extend/consolidate the existing diagnostic logger
+  rather than introducing an independent duplicate. Record startup, operations,
+  warnings and errors with timestamps, application version and useful execution
+  context, while excluding credentials and private project/media content.
+  Keep logs bounded with rotation and available after restart or a crash where
+  possible. Retain the Help actions to open the folder and export diagnostics.
+  Define writable installed and portable locations before implementation; do
+  not assume the installation directory is writable. Document the actual paths
+  and verify log creation, rotation and access on each target platform.
+- During M4B export, display elapsed wall-clock time against estimated total
+  execution time in the export progress dialog, e.g. `02:15 / ~08:30`.
+  This measures export execution, not the audiobook's playback duration.
+  Update the estimate from observed progress using a monotonic clock; show
+  an estimating state until enough progress exists rather than inventing a
+  duration. Include export phases in the estimate where measurable and retain
+  the actual elapsed time on completion, cancellation or failure. Localize FR/EN
+  labels and test unknown estimates, phase transitions and terminal states.
+- Center the welcome message both vertically and horizontally in its available
+  content area. Verify resizing and both FR/EN labels.
+- Fix the unsolicited project-recovery prompt. Identify why a normal session
+  produces a recovery candidate; offer recovery only for a genuinely recoverable
+  unsaved state. Preserve crash recovery and never delete or overwrite user
+  projects merely to suppress the prompt. Cover clean save/close/relaunch,
+  interrupted sessions and restore/dismiss behavior with regression tests.
+- Build distributables in GitHub Actions for Windows, macOS and Linux (all three
+  explicitly confirmed by the user), separately for each target environment,
+  publishing only setup packages and portable ZIPs as downloadable deliverables.
+  Confirm CPU architectures and installer formats before implementation.
+  A portable ZIP does not imply a single-file executable. Preserve updater
+  signatures and required license/source availability; determine how to include
+  compliance material and updater metadata without extra user-facing packages.
+
+## 0.5.0 — requested scope (pending architecture decisions)
+
+- Review the project architecture and introduce a `bin/` directory for external
+  runtime tools/libraries, including FFmpeg and related tools. Define discovery
+  consistently for development, installed and portable execution on each target;
+  preserve pinned versions, integrity checks and licensing.
+- Introduce SQLite persistence. Decide which data belongs in the database
+  (projects, preferences, recent projects, recovery and/or metadata cache), its
+  location, schema versioning and migration/backup strategy before coding.
+  Preserve existing projects and the portability guarantees; do not silently
+  replace the existing project format without an approved migration design.
+- Add online metadata search. Decide providers and searchable fields, then offer
+  an explicit result-selection/preview step before applying metadata. Preserve
+  user edits, handle offline/network failures, respect provider terms and avoid
+  transmitting local audio files without explicit consent.
+
+The 0.5.0 section records requested scope, not implementation approval. The
+0.4.2 development and GitHub CI are approved; release publication remains a
+separate gate. Resolve 0.5.0 architecture/provider choices separately.
