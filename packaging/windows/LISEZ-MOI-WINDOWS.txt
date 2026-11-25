@@ -33,6 +33,5 @@ and stop playback/export first. Historical Linux/Wine checks are not native
 Windows validation.
 
 Sources GPL : source/ ; licences/configurations : source/third-party/ffmpeg/.
-FFmpeg 8.0.1 / zlib 1.3.1 / LAME 3.100 corresponding sources: accompanying -media-sources.zip.
-Keep/publish this sidecar with the binary release. Not needed to run the app.
-See source/README.md, source/README.en.md, source/RELEASE.md and source/docs/testing.md.
+FFmpeg 8.0.1 / zlib 1.3.1 / LAME 3.100 corresponding sources: source/third-party/ffmpeg/.
+See source/README.md, source/README.en.md, source/docs/release.md and source/docs/testing.md.

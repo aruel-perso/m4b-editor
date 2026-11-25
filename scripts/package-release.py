@@ -12,11 +12,10 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-import zipfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-from release_common import MEDIA_BUILD_FILES, SOURCES, VERSION, verify_media, copy_source, copy_licenses, checksums, license_sidecar
+from release_common import archive, VERSION, verify_media, copy_source, copy_media_sources, copy_licenses, checksums
 from windows_msi_ui import add_wizard
 
 MSI_VERSION = VERSION.split('-')[0]
@@ -136,11 +135,6 @@ def verify_pe(file):
             raise SystemExit(f'Unbundled non-system DLL in {file.name}: {name}')
 
 
-def archive(directory, output):
-    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
-        for file in sorted(directory.rglob('*')):
-            if file.is_file(): z.write(file, file.relative_to(directory))
-
 def build_msi(wxs, msi, wixl, msibuild):
     # Stage beside the output so a failed compile or UI import cannot expose
     # a partially built MSI, and the final rename stays on one filesystem.
@@ -187,19 +181,10 @@ def main():
             shutil.copy2(ROOT/'packaging/windows'/name, payload/name)
         source = payload/'source'
         copy_source(source)
-        third = source/'third-party/ffmpeg'
-        third.mkdir(parents=True)
-        for file in MEDIA_BUILD_FILES:
-            shutil.copy2(media/file, third/file)
-        # Upstream source sidecar ships alongside MSI; do not omit it from releases.
-        upstream = Path(temporary)/'media-source'
-        upstream.mkdir()
-        for name in SOURCES:
-            shutil.copy2(media/name, upstream/name)
-        archive(upstream, output/f'{NAME}-media-sources.zip')
-        (payload/'MEDIA-SOURCES.txt').write_text(f'Corresponding FFmpeg/zlib/LAME source archives: {NAME}-media-sources.zip, supplied alongside this MSI. Build recipe and configuration: source/.\n')
+        copy_media_sources(media, source)
+        (payload/'MEDIA-SOURCES.txt').write_text(
+            'Corresponding FFmpeg/zlib/LAME sources, recipes and configuration are under source/.\n')
         copy_licenses(payload)
-        license_sidecar(payload,media,output/f'{NAME}-licenses.zip')
         retained = output/'payload'
         if retained.exists(): shutil.rmtree(retained)
         shutil.copytree(payload, retained)

@@ -19,7 +19,7 @@ def main():
     installers = p.add_mutually_exclusive_group(required=True)
     installers.add_argument('--installer', type=Path)
     installers.add_argument('--msi', type=Path, help='Backward compatible Windows installer alias')
-    p.add_argument('--platform', choices=['windows-x86_64','macos-aarch64'], default='windows-x86_64')
+    p.add_argument('--platform', choices=['windows-x86_64','macos-aarch64','linux-x86_64'], default='windows-x86_64')
     p.add_argument('--version', required=True)
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--scratch', type=Path, required=True)
@@ -30,7 +30,8 @@ def main():
         p.error('Version must be canonical semver without build metadata')
     if a.msi and a.platform != 'windows-x86_64': p.error('--msi requires windows-x86_64')
     a.installer = a.installer or a.msi
-    extension = 'msi' if a.platform == 'windows-x86_64' else 'dmg'
+    if a.legacy and a.platform == 'linux-x86_64': p.error('No legacy Linux update channel')
+    extension = {'windows-x86_64':'msi', 'macos-aarch64':'dmg', 'linux-x86_64':'deb'}[a.platform]
     prefix_name = 'm4b-Craft' if a.legacy else 'M4B-Editor'
     repository = 'm4b-craft' if a.legacy else 'm4b-editor'
     expected = f'{prefix_name}-{a.version}-{a.platform}.{extension}'
@@ -44,8 +45,10 @@ def main():
     prefix = bytes.fromhex('302a300506032b6570032100')
     expected_key = bytes.fromhex((ROOT/'packaging/update-public-key.hex').read_text().strip())
     if public_der != prefix + expected_key: p.error('PEM does not match pinned public key')
+    with a.installer.open('rb') as file:
+        checksum = hashlib.file_digest(file, 'sha256').hexdigest()
     payload = json.dumps(dict(version=a.version, platform=a.platform,filename=expected,
-        sha256=hashlib.sha256(a.installer.read_bytes()).hexdigest(),size=a.installer.stat().st_size,
+        sha256=checksum,size=a.installer.stat().st_size,
         url=f'https://github.com/aruel-perso/{repository}/releases/download/v{a.version}/{expected}'),
         separators=(',',':'),sort_keys=True)
     a.scratch.mkdir(parents=True,exist_ok=True)

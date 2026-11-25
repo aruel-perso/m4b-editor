@@ -31,11 +31,15 @@ def verify(directory, version, legacy=False, signed=False):
     if not valid_version(version): raise ValueError('Invalid semver')
     names = set(); manifests = {}
     prefix = 'm4b-Craft' if legacy else 'M4B-Editor'
-    for platform, extensions in [('windows-x86_64',['msi'] if legacy else ['msi','zip']),('macos-aarch64',['dmg'])]:
+    platforms = [('windows-x86_64', ['msi']), ('macos-aarch64', ['dmg'])]
+    if not legacy:
+        platforms = [(platform, extensions + ['zip']) for platform, extensions in platforms]
+        platforms.append(('linux-x86_64', ['deb', 'zip']))
+    for platform, extensions in platforms:
         base = f'{prefix}-{version}-{platform}'
         names |= {base+'.'+ext for ext in extensions}
-        names.add(base+'-media-sources.zip')
-        names.add(base+'-licenses.zip')
+        if legacy:
+            names.update({base+'-media-sources.zip', base+'-licenses.zip'})
         if signed:
             manifest = f'update-{platform}.json' if legacy else f'update-v2-{platform}.json'
             manifests[manifest] = (base+'.'+extensions[0], platform)
@@ -52,7 +56,7 @@ def verify(directory, version, legacy=False, signed=False):
         if not file.stat().st_size: raise ValueError(f'Empty asset: {name}')
     for name, (installer, platform) in manifests.items():
         verify_envelope(directory/name,directory/installer,version,platform,legacy)
-    print('PASS exact flat assets, SHA-256 sidecars' + (' and pinned signatures' if signed else ''))
+    print('PASS exact flat assets and SHA-256 checksums' + (' and pinned signatures' if signed else ''))
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(); p.add_argument('directory',type=Path); p.add_argument('--version',default=VERSION)

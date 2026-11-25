@@ -56,7 +56,9 @@ with tempfile.TemporaryDirectory(prefix='m4b-editor-windows-tests-', dir=scratch
             print('RUN Windows:',executable.name,flush=True)
             command = [wine,str(copied),'--nocapture','--test-threads=1']
             if args.test_filter: command.append(args.test_filter)
-            subprocess.run(command, cwd=temp,env=env,timeout=180,check=True)
+            # The FFmpeg integration suite decodes a 17-hour synthetic AAC stream.
+            timeout = 600 if executable.name.startswith('ffmpeg-') else 180
+            subprocess.run(command, cwd=temp,env=env,timeout=timeout,check=True)
         print(f'PASS {len(executables)} Windows Rust test executables with bundled FFmpeg/ffprobe and staged fixtures',flush=True)
     finally:
         subprocess.run([server,'-k'],env=env,timeout=20,check=False)

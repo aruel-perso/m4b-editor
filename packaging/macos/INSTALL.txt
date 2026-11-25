@@ -1,5 +1,6 @@
 M4B Editor — AppleSilicon ARM64 only
-Drag M4B Editor.app to Applications, then eject this disk image.
+From the DMG, drag M4B Editor.app to Applications, then eject the disk image.
+For portable use, extract the ZIP and run M4B Editor.app from that directory.
 The bundle contains the GUI, m4b-editor-cli, ffmpeg and ffprobe in Contents/MacOS.
 No Homebrew runtime installation is required.
 This release has ad-hoc code signatures only: no Developer ID or notarization.
@@ -7,7 +8,7 @@ Gatekeeper can block downloaded builds. Only open a build whose origin you trust
 use macOS Privacy & Security / Open Anyway if appropriate for your policy.
 Keep projects/assets outside the application bundle. Copy the entire project
 folder (including assets) when transporting a project. Export M4B for players.
-Corresponding media source is in the accompanying -media-sources.zip;
+Corresponding media source is under Contents/Resources/source/third-party/ffmpeg;
 application source, build configuration and licenses are in Contents/Resources.
 
 The optional legacy image contains m4b-Craft.app for the 0.3 update helper.

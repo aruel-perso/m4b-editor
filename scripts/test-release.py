@@ -252,9 +252,13 @@ class ReleaseTests(unittest.TestCase):
             for legacy in [False,True]:
                 out = root/('legacy' if legacy else 'canonical'); out.mkdir()
                 prefix = 'm4b-Craft' if legacy else 'M4B-Editor'
-                for platform, ext in [('windows-x86_64','msi'),('macos-aarch64','dmg')]:
+                platforms = [('windows-x86_64','msi'),('macos-aarch64','dmg')]
+                if not legacy:
+                    platforms.append(('linux-x86_64','deb'))
+                for platform, ext in platforms:
                     base = f'{prefix}-0.4.0-{platform}'
-                    for suffix in ['.'+ext,'-media-sources.zip','-licenses.zip'] + (['.zip'] if platform=='windows-x86_64' and not legacy else []):
+                    suffixes = ['-media-sources.zip','-licenses.zip'] if legacy else ['.zip']
+                    for suffix in ['.'+ext] + suffixes:
                         file = out/(base+suffix); file.write_bytes(b'offline fixture')
                         file.with_name(file.name+'.sha256').write_text(sha256(file)+'  '+file.name+'\n')
                     manifest = out/(f'update-{platform}.json' if legacy else f'update-v2-{platform}.json')
@@ -293,9 +297,36 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'separately built'):
                 legacy.prepare(canonical,canonical_dmg,root/'bad','0.4.0')
 
+    def test_legacy_sources_are_rebuilt_from_current_portable_payload(self):
+        from release_common import MEDIA_LICENSES
+        spec = importlib.util.spec_from_file_location('legacy', ROOT/'scripts/prepare-legacy-release.py')
+        legacy = importlib.util.module_from_spec(spec); spec.loader.exec_module(legacy)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            root = Path(d)
+            canonical = root/'canonical'; canonical.mkdir()
+            compat = root/'compat'; compat.mkdir()
+            name = 'M4B-Editor-0.4.2-windows-x86_64'
+            (canonical/f'{name}.msi').write_bytes(b'windows fixture')
+            with zipfile.ZipFile(canonical/f'{name}.zip', 'w') as portable:
+                for item in (*SOURCES, *MEDIA_LICENSES):
+                    portable.writestr('source/third-party/ffmpeg/'+item, b'media fixture')
+                for item in ('LICENSE', 'THIRD-PARTY-NOTICES.txt', 'licenses/test/LICENSE'):
+                    portable.writestr(item, b'license fixture')
+            dmg = compat/'m4b-Craft-0.4.2-macos-aarch64.dmg'
+            dmg.write_bytes(b'mac fixture')
+            for suffix in ('media-sources', 'licenses'):
+                dmg.with_name(f'{dmg.stem}-{suffix}.zip').write_bytes(b'mac sidecar fixture')
+            output = root/'output'
+            legacy.prepare(canonical, dmg, output, '0.4.2')
+            with zipfile.ZipFile(output/'m4b-Craft-0.4.2-windows-x86_64-media-sources.zip') as archive:
+                self.assertEqual(set(archive.namelist()), set(SOURCES))
+            with zipfile.ZipFile(output/'m4b-Craft-0.4.2-windows-x86_64-licenses.zip') as archive:
+                self.assertIn('licenses/test/LICENSE', archive.namelist())
+                self.assertIn('media/COPYING.LGPLv2.1', archive.namelist())
+
     def test_source_pins_match_fetch_and_platform_recipes(self):
         for name, digest in SOURCES.items():
-            for script in ['fetch-media-sources.sh','build-ffmpeg-windows.sh','build-ffmpeg-macos.sh']:
+            for script in ['fetch-media-sources.sh','build-ffmpeg-windows.sh','build-ffmpeg-unix.sh']:
                 text = (ROOT/'scripts'/script).read_text()
                 self.assertIn(name,text)
                 self.assertIn(digest,text)
@@ -394,8 +425,8 @@ class ReleaseTests(unittest.TestCase):
         assets = importlib.util.module_from_spec(spec); spec.loader.exec_module(assets)
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             directory = Path(d)
-            for platform, extensions in [('windows-x86_64',['msi','zip']),('macos-aarch64',['dmg'])]:
-                for suffix in ['.'+ext for ext in extensions]+['-media-sources.zip','-licenses.zip']:
+            for platform, installer in [('windows-x86_64','msi'),('macos-aarch64','dmg'),('linux-x86_64','deb')]:
+                for suffix in ['.'+installer, '.zip']:
                     file = directory/f'M4B-Editor-0.4.0-{platform}{suffix}'
                     file.write_bytes(b'fixture')
                     file.with_name(file.name+'.sha256').write_text(sha256(file)+'  '+file.name+'\n')
@@ -532,12 +563,9 @@ def inspect(msi, scratch):
         for name in ['m4b-editor.exe','m4b-editor-cli.exe','ffmpeg.exe','ffprobe.exe','source/crates/desktop/src/updater.rs','source/Cargo.lock']:
             assert name in archive.namelist(),name
         assert not any(name.lower().endswith(('.pem','.key','7z.exe','7z.dll','license.7zip')) for name in archive.namelist())
-    sidecar = msi.with_name(msi.stem+'-media-sources.zip')
-    with zipfile.ZipFile(sidecar) as archive:
-        assert archive.testzip() is None
-        assert set(archive.namelist()) == set(SOURCES)
         for name, digest in SOURCES.items():
-            assert hashlib.sha256(archive.read(name)).hexdigest() == digest
+            embedded = archive.read('source/third-party/ffmpeg/'+name)
+            assert hashlib.sha256(embedded).hexdigest() == digest
     with tempfile.TemporaryDirectory(dir=scratch) as d:
         subprocess.run([os.environ.get('MSIEXTRACT','msiextract'),'-C',d,str(msi)],check=True,stdout=subprocess.DEVNULL)
         for path in Path(d).rglob('m4b-editor.exe'):
@@ -546,6 +574,8 @@ def inspect(msi, scratch):
             verify_pe_icon(path)
             assert (path.parent/'source/crates/desktop/src/updater.rs').exists()
             assert (path.parent/'ffprobe.exe').exists()
+            from release_common import verify_source_archives
+            verify_source_archives(path.parent/'source/third-party/ffmpeg')
             break
         else: raise AssertionError('Missing extracted application')
 
@@ -557,4 +587,4 @@ if __name__ == '__main__':
     if not result.wasSuccessful(): raise SystemExit(1)
     if args.msi:
         inspect(args.msi.resolve(),SCRATCH)
-        print('PASS MSI tables/extraction, portable ZIP contents/CRC, source sidecar hashes, key exclusion')
+        print('PASS MSI tables/extraction, portable ZIP contents/CRC, embedded source hashes, key exclusion')

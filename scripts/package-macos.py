@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from release_common import MEDIA_BUILD_FILES, ROOT, VERSION, SOURCES, verify_media, copy_source, copy_licenses, checksums, license_sidecar
+from release_common import archive, ROOT, VERSION, SOURCES, verify_media, copy_source, copy_media_sources, copy_licenses, checksums, license_sidecar
 from importlib.util import spec_from_file_location, module_from_spec
 
 def load(name):
@@ -58,12 +58,11 @@ def main():
         (contents/'PkgInfo').write_bytes(b'APPL????')
         copy_source(resources/'source'); copy_licenses(resources)
         shutil.copy2(ROOT/'LICENSE',resources/'LICENSE')
-        license_sidecar(resources,media,output/f'{name}-licenses.zip')
-        third = resources/'source/third-party/ffmpeg'; third.mkdir(parents=True)
-        for file in MEDIA_BUILD_FILES:
-            shutil.copy2(media/file, third/file)
-        (resources/'MEDIA-SOURCES.txt').write_text(f'Corresponding FFmpeg/zlib/LAME source archives: {name}-media-sources.zip alongside this DMG. Build recipes/configuration: source/.\n')
+        copy_media_sources(media, resources/'source')
+        (resources/'MEDIA-SOURCES.txt').write_text(
+            'Corresponding FFmpeg/zlib/LAME sources, recipes and configuration are under source/.\n')
         if a.legacy:
+            license_sidecar(resources,media,output/f'{name}-licenses.zip')
             shutil.copy2(binaries/'m4b-editor', binaries/'m4b-Craft')
             info['CFBundleExecutable'] = 'm4b-Craft'
             (contents/'Info.plist').write_bytes(plistlib.dumps(info))
@@ -75,11 +74,14 @@ def main():
         for binary in binaries.iterdir(): subprocess.run(['codesign','--force','--sign','-',str(binary)],check=True)
         subprocess.run(['codesign','--force','--sign','-',str(app)],check=True)
         subprocess.run(['codesign','--verify','--deep','--strict',str(app)],check=True)
-        (stage/'Applications').symlink_to('/Applications')
         shutil.copy2(ROOT/'packaging/macos/INSTALL.txt',stage/'INSTALL.txt')
-        sidecar = Path(temporary)/'media-source'; sidecar.mkdir()
-        for source in SOURCES: shutil.copy2(media/source,sidecar/source)
-        load('package-release').archive(sidecar,output/f'{name}-media-sources.zip')
+        if a.legacy:
+            sidecar = Path(temporary)/'media-source'; sidecar.mkdir()
+            for source in SOURCES: shutil.copy2(media/source,sidecar/source)
+            archive(sidecar,output/f'{name}-media-sources.zip')
+        else:
+            subprocess.run(['ditto','-c','-k','--sequesterRsrc',str(stage),str(output/f'{name}.zip')],check=True)
+        (stage/'Applications').symlink_to('/Applications')
         dmg = output/f'{name}.dmg'
         if dmg.exists(): dmg.unlink()
         subprocess.run(['hdiutil','create','-volname','M4B Editor','-srcfolder',str(stage),'-format','UDZO','-ov',str(dmg)],check=True)

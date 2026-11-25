@@ -3,7 +3,8 @@
 import argparse
 from pathlib import Path
 import shutil
-from release_common import VERSION, checksums, valid_version
+import zipfile
+from release_common import VERSION, MEDIA_LICENSES, SOURCES, checksums, valid_version
 
 def prepare(canonical, legacy_dmg, output, version):
     if not valid_version(version): raise ValueError('Invalid semver')
@@ -21,11 +22,29 @@ def prepare(canonical, legacy_dmg, output, version):
         if source.is_symlink() or not source.is_file() or not source.stat().st_size:
             raise ValueError(f'Invalid installer: {source}')
         shutil.copy2(source, output/name)
-    # Same corresponding sources cover both installation payloads.
-    for platform in ['windows-x86_64','macos-aarch64']:
-        for suffix in ['media-sources','licenses']:
-            name = f'M4B-Editor-{version}-{platform}-{suffix}.zip'
-            shutil.copy2(canonical/name, output/name.replace('M4B-Editor','m4b-Craft'))
+    # Older releases provided sidecars. Current Windows packages include them as
+    # source archives and license files inside the portable payload.
+    windows_base = windows.removesuffix('.msi')
+    for suffix in ('media-sources', 'licenses'):
+        name = f'{windows_base}-{suffix}.zip'
+        destination = output/name.replace('M4B-Editor','m4b-Craft')
+        if (canonical/name).is_file():
+            shutil.copy2(canonical/name, destination)
+        else:
+            with zipfile.ZipFile(canonical/f'{windows_base}.zip') as portable:
+                with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
+                    media = 'source/third-party/ffmpeg/'
+                    if suffix == 'media-sources':
+                        members = [(media + source, source) for source in SOURCES]
+                    else:
+                        members = [(media + license, 'media/' + license) for license in MEDIA_LICENSES]
+                        members += [(path, path) for path in portable.namelist()
+                                    if path.startswith('licenses/') or path in ('LICENSE', 'THIRD-PARTY-NOTICES.txt')]
+                    for source, member in members:
+                        archive.writestr(member, portable.read(source))
+        legacy_sidecar = legacy_dmg.with_name(f'{legacy_dmg.stem}-{suffix}.zip')
+        old_sidecar = canonical/legacy_sidecar.name.replace('m4b-Craft','M4B-Editor')
+        shutil.copy2(legacy_sidecar if legacy_sidecar.is_file() else old_sidecar, output/legacy_sidecar.name)
     checksums(output)
 
 if __name__ == '__main__':

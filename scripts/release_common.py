@@ -49,7 +49,8 @@ def verify_media(media, platform):
     expected = set(executables) | set(SOURCES) | set(MEDIA_BUILD_FILES)
     # Old, complete pinned caches can supply the same FFmpeg build. Package
     # callers use the explicit media file lists and never copy these extras.
-    legacy = LEGACY_ARCHIVER_SOURCES | LEGACY_ARCHIVER_MEMBERS[platform]
+    legacy = (LEGACY_ARCHIVER_SOURCES | LEGACY_ARCHIVER_MEMBERS[platform]
+              if platform in LEGACY_ARCHIVER_MEMBERS else {})
     actual = {p.name for p in media.iterdir()} - {'SHA256SUMS'}
     if actual == expected | legacy.keys():
         expected |= legacy.keys()
@@ -85,6 +86,18 @@ def copy_source(destination):
         shutil.copytree(ROOT/name, destination/name, ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
     for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','README.en.md']:
         shutil.copy2(ROOT/name, destination/name)
+def copy_media_sources(media, source_directory):
+    destination = source_directory/'third-party/ffmpeg'
+    destination.mkdir(parents=True)
+    for name in (*MEDIA_BUILD_FILES, *SOURCES):
+        shutil.copy2(media/name, destination/name)
+    return destination
+
+def verify_source_archives(directory):
+    for name, digest in SOURCES.items():
+        if sha256(directory/name) != digest:
+            raise ValueError(f'Bundled media source checksum mismatch: {name}')
+
 def copy_licenses(destination):
     import json
     metadata = json.loads(subprocess.check_output(['cargo','metadata','--locked','--offline','--format-version=1'],cwd=ROOT))
@@ -118,15 +131,22 @@ def license_sidecar(payload, media, output):
             if file.is_symlink(): raise ValueError(f'Symlinked license: {file}')
             archive.write(file,name)
 
+def archive(directory, output):
+    import zipfile
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, strict_timestamps=False) as zipped:
+        for file in sorted(directory.rglob('*')):
+            if file.is_file():
+                zipped.write(file, file.relative_to(directory))
+
 def checksums(output):
     for file in sorted(output.iterdir()):
-        if file.suffix in ('.msi','.dmg','.zip'):
+        if file.suffix in ('.msi','.dmg','.deb','.zip'):
             file.with_name(file.name+'.sha256').write_text(sha256(file)+'  '+file.name+'\n')
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--media',type=Path)
-    parser.add_argument('--platform',choices=['windows-x86_64','macos-aarch64'])
+    parser.add_argument('--platform',choices=['windows-x86_64','macos-aarch64','linux-x86_64'])
     args = parser.parse_args()
     if args.media:
         if not args.platform: parser.error('--platform required with --media')

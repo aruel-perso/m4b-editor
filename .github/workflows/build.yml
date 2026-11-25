@@ -106,7 +106,7 @@ jobs:
         id: media-cache
         with:
           path: vendor/macos-media
-          key: macos-aarch64-media-${{ hashFiles('scripts/build-ffmpeg-macos.sh', 'scripts/ffmpeg-options.sh', 'scripts/fetch-media-sources.sh', 'scripts/release_common.py', 'scripts/verify-macos.py') }}
+          key: macos-aarch64-media-${{ hashFiles('scripts/build-ffmpeg-macos.sh', 'scripts/build-ffmpeg-unix.sh', 'scripts/ffmpeg-options.sh', 'scripts/fetch-media-sources.sh', 'scripts/release_common.py', 'scripts/verify-macos.py') }}
       - name: Build pinned native static media tools
         if: steps.media-cache.outputs.cache-hit != 'true'
         run: |
@@ -142,9 +142,64 @@ jobs:
             dist/release-${{ steps.version.outputs.value }}/*.zip
             dist/release-${{ steps.version.outputs.value }}/*.sha256
           if-no-files-found: error
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      TMPDIR: /home/runner/m4b-linux-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: mkdir -p "$TMPDIR"
+      - id: version
+        run: echo "value=$(python3 scripts/release_common.py)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64-release
+      - uses: actions/cache@v4
+        id: media-cache
+        with:
+          path: vendor/linux-media
+          key: linux-x86_64-media-${{ hashFiles('scripts/build-ffmpeg-unix.sh', 'scripts/ffmpeg-options.sh', 'scripts/fetch-media-sources.sh', 'scripts/release_common.py') }}
+      - name: Build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev unzip xvfb xauth xdotool libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libegl1 libgl1 xdg-utils
+      - name: Build pinned native media tools
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        run: |
+          bash scripts/fetch-media-sources.sh "$TMPDIR"
+          bash scripts/build-ffmpeg-unix.sh linux "$TMPDIR/ffmpeg-8.0.1.tar.xz" "$TMPDIR/zlib-1.3.1.tar.gz" "$TMPDIR/lame-3.100.tar.gz"
+      - run: python3 scripts/release_common.py --media vendor/linux-media --platform linux-x86_64
+      - name: Test with pinned Linux media
+        run: |
+          export PATH="$PWD/vendor/linux-media:$PATH"
+          cargo fetch --locked
+          cargo test --locked --workspace
+      - run: python3 scripts/package-linux.py
+      - name: Install DEB and exercise installed and portable CLI
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          DEB="dist/release-$VERSION/M4B-Editor-$VERSION-linux-x86_64.deb"
+          sudo apt-get install -y "./$DEB"
+          python3 scripts/test-linux-release.py --deb "$DEB" --scratch "$TMPDIR"
+          xvfb-run -a python3 scripts/smoke-desktop.py /usr/bin/m4b-editor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            dist/release-${{ steps.version.outputs.value }}/*.deb
+            dist/release-${{ steps.version.outputs.value }}/*.zip
+            dist/release-${{ steps.version.outputs.value }}/*.sha256
+          if-no-files-found: error
   release:
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'aruel-perso/m4b-editor'
-    needs: [windows, macos]
+    needs: [windows, macos, linux]
     runs-on: ubuntu-24.04
     env:
       TMPDIR: /home/runner/m4b-release-${{ github.run_id }}
@@ -166,7 +221,7 @@ jobs:
           VERSION=$(python3 scripts/release_common.py)
           test "$GITHUB_REF_NAME" = "v$VERSION"
           python3 scripts/verify-release-assets.py release-assets --version "$VERSION"
-      - name: Sign both platform manifests
+      - name: Sign platform manifests
         env:
           UPDATE_SIGNING_PEM: ${{ secrets.UPDATE_SIGNING_PEM }}
         run: |
@@ -176,17 +231,27 @@ jobs:
           trap 'rm -f "$TMPDIR/update-signing.pem"' EXIT
           printf '%s\n' "$UPDATE_SIGNING_PEM" > "$TMPDIR/update-signing.pem"
           VERSION=$(python3 scripts/release_common.py)
-          for PLATFORM in windows-x86_64 macos-aarch64; do
-            EXT=msi
-            if [ "$PLATFORM" = macos-aarch64 ]; then EXT=dmg; fi
+          for PLATFORM in windows-x86_64 macos-aarch64 linux-x86_64; do
+            case "$PLATFORM" in
+              windows-x86_64) EXT=msi ;;
+              macos-aarch64) EXT=dmg ;;
+              linux-x86_64) EXT=deb ;;
+            esac
             python3 scripts/sign-update.py --key "$TMPDIR/update-signing.pem" --version "$VERSION" --platform "$PLATFORM" --installer "release-assets/M4B-Editor-$VERSION-$PLATFORM.$EXT" --out "release-assets/update-v2-$PLATFORM.json" --scratch "$TMPDIR"
           done
       - name: Verify final signed allowlist
         run: python3 scripts/verify-release-assets.py release-assets --signed
-      - name: Publish only after both builds, validation and signatures
+      - name: Publish only after all builds, validation and signatures
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           FLAGS=()
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then FLAGS+=(--prerelease); fi
-          gh release create "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag "${FLAGS[@]}" --title "M4B Editor ${GITHUB_REF_NAME#v}" --notes-file docs/release.md
+          NOTES="$RUNNER_TEMP/m4b-release-notes.md"
+          {
+            cat docs/release.md
+            printf '\n## SHA-256\n\n```text\n'
+            cat release-assets/*.sha256
+            printf '```\n'
+          } > "$NOTES"
+          gh release create "$GITHUB_REF_NAME" release-assets/*.{msi,dmg,deb,zip,json} --repo "$GITHUB_REPOSITORY" --verify-tag "${FLAGS[@]}" --title "M4B Editor ${GITHUB_REF_NAME#v}" --notes-file "$NOTES"

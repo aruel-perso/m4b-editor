@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Compatibility entry point for the current locked Windows release packager.
-Produces MSI, portable ZIP and corresponding-source sidecars (not legacy debug ZIP).
+Produces an MSI and a portable ZIP with embedded corresponding sources.
 Accepts the same arguments as package-release.py.
 """
 import runpy

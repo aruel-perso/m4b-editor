@@ -1,0 +1,10 @@
+M4B Editor for Linux x86_64
+
+Installer: sudo apt install ./M4B-Editor-VERSION-linux-x86_64.deb
+Portable: unzip to a writable directory and run ./m4b-editor.
+The Linux build targets Ubuntu 24.04 and compatible systems. Install the
+runtime packages listed under Depends in the DEB if using the ZIP.
+
+The CLI is m4b-editor-cli. Keep FFmpeg and FFprobe next to both executables.
+Application and media sources, build configuration and licenses are under
+source/ and licenses/ (installed under /usr/lib/m4b-editor).

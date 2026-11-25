@@ -15,7 +15,7 @@ import tempfile
 import wave
 import zipfile
 import zlib
-from release_common import ROOT, VERSION, SOURCES
+from release_common import ROOT, VERSION, verify_source_archives
 
 
 def main():
@@ -96,12 +96,8 @@ def main():
             assert len(json.loads(imported.read_text())['tracks']) == 1
         # Actual application binary sources and media sources must be included.
         assert (package / 'source/crates/desktop/src/playback.rs').is_file()
-        sources_path = args.archive.with_name(args.archive.stem + '-media-sources.zip')
-        with zipfile.ZipFile(sources_path) as upstream:
-            assert upstream.testzip() is None
-            for name in SOURCES:
-                assert any(path == name or path.endswith('/' + name) for path in upstream.namelist()), name
-        print('PASS corresponding application source and accompanying bundled media source present')
+        verify_source_archives(package/'source/third-party/ffmpeg')
+        print('PASS corresponding application source and embedded media source present')
     subprocess.run(['/usr/lib/wine/wineserver64', '-k'], env=env, timeout=20, check=False)
 
 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=M4B Editor
+Comment=Edit and export audiobooks
+Comment[fr]=Éditer et exporter des livres audio
+Exec=m4b-editor
+Icon=m4b-editor
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;

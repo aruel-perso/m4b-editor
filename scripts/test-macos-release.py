@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Native DMG mount/install/CLI media test. Does not launch or test the GUI."""
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -11,8 +10,7 @@ import struct
 import subprocess
 import tempfile
 import wave
-import zipfile
-from release_common import ROOT, SOURCES, VERSION
+from release_common import ROOT, VERSION, verify_source_archives
 
 spec = importlib.util.spec_from_file_location('verify',Path(__file__).with_name('verify-macos.py'))
 verify = importlib.util.module_from_spec(spec); spec.loader.exec_module(verify)
@@ -25,11 +23,6 @@ def main():
     a = p.parse_args()
     assert os.uname().machine == 'arm64' and os.uname().sysname == 'Darwin'
     dmg = a.dmg.resolve()
-    sidecar = dmg.with_name(dmg.stem+'-media-sources.zip')
-    with zipfile.ZipFile(sidecar) as archive:
-        assert set(archive.namelist()) == set(SOURCES)
-        assert archive.testzip() is None
-        for name,digest in SOURCES.items(): assert hashlib.sha256(archive.read(name)).hexdigest() == digest
     with tempfile.TemporaryDirectory(prefix='m4b-dmg-test-',dir=a.scratch) as temporary:
         work = Path(temporary); mount = work/'mounted'; mount.mkdir()
         run('hdiutil','attach','-readonly','-nobrowse','-mountpoint',mount,dmg)
@@ -42,6 +35,7 @@ def main():
             assert info['CFBundleShortVersionString'] == VERSION.split('-')[0]
             assert info['UTExportedTypeDeclarations'][0]['UTTypeTagSpecification']['public.filename-extension'] == ['m4bproj']
             resources = source/'Contents/Resources'
+            verify_source_archives(resources/'source/third-party/ffmpeg')
             assert info['CFBundleIconFile'] == 'app.icns'
             assert (resources/info['CFBundleIconFile']).read_bytes() == (ROOT/'packaging/icons/app.icns').read_bytes()
             for required in ['LICENSE','THIRD-PARTY-NOTICES.txt','MEDIA-SOURCES.txt',
@@ -68,6 +62,14 @@ def main():
         cli = binaries/'m4b-editor-cli'
         version = subprocess.check_output([str(cli),'--version'],text=True,env=env)
         assert VERSION in version
+        if not a.legacy:
+            portable = work/'portable'; portable.mkdir()
+            run('ditto', '-x', '-k', dmg.with_suffix('.zip'), portable)
+            assert not (portable/'Applications').exists()
+            app = portable/'M4B Editor.app'
+            run('codesign', '--verify', '--deep', '--strict', app)
+            verify_source_archives(app/'Contents/Resources/source/third-party/ffmpeg')
+            run(app/'Contents/MacOS/m4b-editor-cli', '--version', env=env)
         for fixture in ['audio.zip', 'audio.rar']:
             archived_project = work/(fixture + '.m4bproj')
             run(cli,'new','--project',archived_project,ROOT/'tests/fixtures'/fixture,env=env)
