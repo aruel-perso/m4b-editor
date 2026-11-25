@@ -9,6 +9,7 @@ import plistlib
 import struct
 import subprocess
 import tempfile
+import time
 import wave
 from release_common import ROOT, VERSION, verify_source_archives
 
@@ -16,6 +17,20 @@ spec = importlib.util.spec_from_file_location('verify',Path(__file__).with_name(
 verify = importlib.util.module_from_spec(spec); spec.loader.exec_module(verify)
 def run(*args, **kwargs):
     return subprocess.run([str(a) for a in args],check=True,**kwargs)
+def attach_readonly(mount, dmg):
+    for attempt in range(3):
+        result = subprocess.run(['hdiutil', 'attach', '-readonly', '-nobrowse',
+                                 '-mountpoint', str(mount), str(dmg)],
+                                capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            print(result.stdout, end='')
+            return
+        if 'Resource temporarily unavailable' not in result.stderr or attempt == 2:
+            raise subprocess.CalledProcessError(result.returncode, result.args,
+                                                output=result.stdout, stderr=result.stderr)
+        print(f'Transient disk-image resource contention; retry {attempt + 1}/2', flush=True)
+        time.sleep(2 ** (attempt + 1))
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--legacy',action='store_true')
@@ -25,7 +40,7 @@ def main():
     dmg = a.dmg.resolve()
     with tempfile.TemporaryDirectory(prefix='m4b-dmg-test-',dir=a.scratch) as temporary:
         work = Path(temporary); mount = work/'mounted'; mount.mkdir()
-        run('hdiutil','attach','-readonly','-nobrowse','-mountpoint',mount,dmg)
+        attach_readonly(mount, dmg)
         try:
             assert (mount/'Applications').is_symlink()
             assert os.readlink(mount/'Applications') == '/Applications'

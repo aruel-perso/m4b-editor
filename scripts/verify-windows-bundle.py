@@ -21,6 +21,7 @@ from release_common import ROOT, VERSION, verify_source_archives
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('archive', type=Path)
+    parser.add_argument('--msi', type=Path, help='Also install, exercise and uninstall this exact MSI')
     args = parser.parse_args()
     scratch = Path(os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch')))
     scratch.mkdir(parents=True, exist_ok=True)
@@ -98,6 +99,28 @@ def main():
         assert (package / 'source/crates/desktop/src/playback.rs').is_file()
         verify_source_archives(package/'source/third-party/ffmpeg')
         print('PASS corresponding application source and embedded media source present')
+        if args.msi:
+            before = {p: hashlib.sha256(p.read_bytes()).digest()
+                      for p in (*tracks, cover, project, output)}
+            installer = r'C:\windows\system32\msiexec.exe'
+            install_log = temp/'install.log'
+            run(installer, '/i', win(args.msi), '/qn', '/norestart', '/L*v', win(install_log))
+            candidates = list((Path(env['WINEPREFIX'])/'drive_c/users').glob(
+                '*/AppData/Local/Programs/M4B Editor/m4b-editor-cli.exe'))
+            assert len(candidates) == 1, f'Expected installed CLI, found {candidates}'
+            installed = candidates[0]
+            assert VERSION in run(installed, '--version').stdout
+            installed_output = cwd/'installed-export.m4b'
+            run(installed, 'export', win(project), win(installed_output))
+            installed_probe = json.loads(run(installed, 'probe', win(installed_output)).stdout)
+            assert installed_probe['tracks'][0]['codec'] == 'aac'
+            assert len(installed_probe['chapters']) == 2
+            run(installer, '/x', win(args.msi), '/qn', '/norestart', '/L*v', win(temp/'uninstall.log'))
+            assert not installed.exists(), 'Uninstall retained installed executable'
+            for path, digest in before.items():
+                assert path.is_file() and hashlib.sha256(path.read_bytes()).digest() == digest
+            assert installed_output.is_file(), 'Uninstall deleted external exported audio'
+            print('PASS exact MSI silent installation, installed CLI export/probe, uninstall and external data preservation (Wine, not native Windows)')
     subprocess.run(['/usr/lib/wine/wineserver64', '-k'], env=env, timeout=20, check=False)
 
 

@@ -31,6 +31,26 @@ def verify_pe_icon(path):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_mac_attach_retries_only_transient_contention(self):
+        spec = importlib.util.spec_from_file_location('dmg_test', ROOT/'scripts/test-macos-release.py')
+        assert spec is not None and spec.loader is not None
+        dmg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dmg)
+        def result(code, stderr=''):
+            return subprocess.CompletedProcess(['hdiutil'], code, stdout='', stderr=stderr)
+        transient = result(1, 'Resource temporarily unavailable')
+        with patch.object(dmg.subprocess, 'run', side_effect=[transient, result(0)]) as run, patch.object(dmg.time, 'sleep'):
+            dmg.attach_readonly(Path('mount'), Path('test.dmg'))
+            self.assertEqual(run.call_count, 2)
+        with patch.object(dmg.subprocess, 'run', return_value=transient) as run, patch.object(dmg.time, 'sleep'):
+            with self.assertRaises(subprocess.CalledProcessError):
+                dmg.attach_readonly(Path('mount'), Path('test.dmg'))
+            self.assertEqual(run.call_count, 3)
+        with patch.object(dmg.subprocess, 'run', return_value=result(1, 'image corrupt')) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                dmg.attach_readonly(Path('mount'), Path('test.dmg'))
+            self.assertEqual(run.call_count, 1)
+
     def test_linux_runtime_dependencies_include_dynamically_loaded_xkb(self):
         spec = importlib.util.spec_from_file_location('linux_package', ROOT/'scripts/package-linux.py')
         assert spec is not None and spec.loader is not None
