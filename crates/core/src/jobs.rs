@@ -210,6 +210,14 @@ fn diagnostic_category(stderr: &str) -> &'static str {
         "permission_denied"
     } else if text.contains("invalid data found") {
         "invalid_input"
+    } else if text.contains("cannot allocate memory") {
+        if text.lines().any(|line| {
+            line.contains("packet to the muxer") && line.contains("cannot allocate memory")
+        }) {
+            "muxer_allocation_failed"
+        } else {
+            "allocation_failed"
+        }
     } else if text.contains("input/output error") {
         "io_error"
     } else if text.is_empty() {

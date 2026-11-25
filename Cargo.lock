@@ -2420,7 +2420,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "m4b-editor-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2432,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "m4b-editor-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "m4b-editor-desktop"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "cc",

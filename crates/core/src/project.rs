@@ -225,7 +225,14 @@ impl DesktopFfmpeg {
                     "pcm_s16le".into(),
                     path.as_os_str().into(),
                 ];
-                self.run(&args, &cancel, event, 0., 0., to - from)?;
+                self.run(
+                    &args,
+                    &cancel,
+                    event,
+                    0. ..0.,
+                    to - from,
+                    super::ENCODER_ALLOCATION_LIMIT,
+                )?;
                 excerpt.tracks.push(self.probe(&path)?.track);
             }
             cursor = end;

@@ -635,9 +635,9 @@ impl DesktopFfmpeg {
         args: &[std::ffi::OsString],
         cancel: &Cancel,
         event: &mut dyn FnMut(ExportEvent),
-        base: f32,
-        span: f32,
+        progress: std::ops::Range<f32>,
         duration_ms: u64,
+        max_alloc: u64,
     ) -> Result<()> {
         if cancel.load(AtomicOrdering::Relaxed) {
             bail!("Export cancelled");
@@ -650,8 +650,6 @@ impl DesktopFfmpeg {
                 "warning",
                 "-threads",
                 "1",
-                "-max_alloc",
-                "67108864",
                 "-filter_threads",
                 "1",
                 "-filter_complex_threads",
@@ -660,6 +658,7 @@ impl DesktopFfmpeg {
                 "pipe:1",
                 "-nostats",
             ])
+            .args(["-max_alloc", &max_alloc.to_string()])
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -669,8 +668,10 @@ impl DesktopFfmpeg {
             if let ExportEvent::Activity { media_time_us, .. } = activity {
                 if media_time_us > 0 {
                     event(ExportEvent::Progress(
-                        base + span
-                            * (media_time_us as f32 / (duration_ms.max(1) as f32 * 1000.)).min(1.),
+                        progress.start
+                            + (progress.end - progress.start)
+                                * (media_time_us as f32 / (duration_ms.max(1) as f32 * 1000.))
+                                    .min(1.),
                     ));
                 }
             }
@@ -678,6 +679,83 @@ impl DesktopFfmpeg {
         })
     }
 }
+const ENCODER_ALLOCATION_LIMIT: u64 = 64 * 1024 * 1024;
+const AAC_MUX_ALLOCATION_LIMIT: u64 = 256 * 1024 * 1024;
+// The MOV demuxer uses 24-byte index entries on supported 64-bit targets.
+// 128 MiB covers the packet count admitted by the 72-byte mux index at 256 MiB.
+const AUDIO_INPUT_ALLOCATION_LIMIT: u64 = 128 * 1024 * 1024;
+
+fn aac_mux_allocation_limit(duration_ms: u64, minimum: u64) -> u64 {
+    // FFmpeg 8.0.1 movenc grows its 64-bit MOVIentry array in groups of
+    // 1024 packets. The staged input is 48 kHz and AAC writes a packet per
+    // 1024 samples. Allow two extra packets for encoder delay and padding.
+    let packets = duration_ms
+        .saturating_mul(48)
+        .div_ceil(1024)
+        .saturating_add(2);
+    let index_bytes = packets.div_ceil(1024).saturating_mul(1024 * 72);
+    index_bytes.clamp(minimum, AAC_MUX_ALLOCATION_LIMIT)
+}
+
+#[cfg(test)]
+#[test]
+fn aac_mov_packet_index_allocation_regression() {
+    let ffmpeg = DesktopFfmpeg::default().ffmpeg;
+    let directory = tempfile::tempdir().unwrap();
+    let baseline = 1024 * 1024; // Exercise the same boundary with small synthetic audio.
+    let encode = |file: &str, limit: u64| {
+        command(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-v",
+                "warning",
+                "-max_alloc",
+                &limit.to_string(),
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-t",
+                "420",
+                "-c:a",
+                "aac",
+                "-threads:a",
+                "1",
+                "-f",
+                "ipod",
+            ])
+            .arg(directory.path().join(file))
+            .output()
+            .unwrap()
+    };
+    let limited = encode("limited.m4b", baseline);
+    assert!(!limited.status.success());
+    let stderr = String::from_utf8_lossy(&limited.stderr);
+    assert!(
+        stderr.contains("Error muxing a packet") && stderr.contains("Cannot allocate memory"),
+        "{stderr}"
+    );
+    let widened = encode("widened.m4b", aac_mux_allocation_limit(420_000, baseline));
+    assert!(
+        widened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&widened.stderr)
+    );
+    assert_eq!(
+        aac_mux_allocation_limit(60_000, ENCODER_ALLOCATION_LIMIT),
+        ENCODER_ALLOCATION_LIMIT
+    );
+    assert!(
+        aac_mux_allocation_limit(15 * 60 * 60 * 1000, ENCODER_ALLOCATION_LIMIT)
+            > ENCODER_ALLOCATION_LIMIT
+    );
+    assert_eq!(
+        aac_mux_allocation_limit(u64::MAX, ENCODER_ALLOCATION_LIMIT),
+        256 * 1024 * 1024
+    );
+}
+
 fn tag(v: &serde_json::Value, key: &str) -> String {
     v.as_object()
         .and_then(|object| {
@@ -732,7 +810,7 @@ fn meta_escape(s: &str) -> String {
         .replace('\n', "\\\n")
 }
 impl DesktopFfmpeg {
-    fn probe_document(&self, path: &Path) -> Result<(PathBuf, serde_json::Value)> {
+    fn probe_document(&self, path: &Path, max_alloc: u64) -> Result<(PathBuf, serde_json::Value)> {
         let path =
             dunce::canonicalize(path).with_context(|| format!("Read source {}", path.display()))?;
         let o = jobs::capture(
@@ -740,6 +818,8 @@ impl DesktopFfmpeg {
                 .args([
                     "-v",
                     "error",
+                    "-max_alloc",
+                    &max_alloc.to_string(),
                     "-show_format",
                     "-show_streams",
                     "-show_chapters",
@@ -759,7 +839,7 @@ impl DesktopFfmpeg {
         Ok((path, v))
     }
     pub fn audio_streams(&self, path: &Path) -> Result<Vec<AudioStream>> {
-        let (_, v) = self.probe_document(path)?;
+        let (_, v) = self.probe_document(path, AUDIO_INPUT_ALLOCATION_LIMIT)?;
         Ok(v["streams"]
             .as_array()
             .context("No streams")?
@@ -775,7 +855,7 @@ impl DesktopFfmpeg {
             .collect())
     }
     pub fn probe_stream(&self, path: &Path, stream_index: Option<u32>) -> Result<Probe> {
-        let (path, v) = self.probe_document(path)?;
+        let (path, v) = self.probe_document(path, AUDIO_INPUT_ALLOCATION_LIMIT)?;
         let streams = v["streams"].as_array().context("No streams")?;
         let audio = streams
             .iter()
@@ -891,7 +971,9 @@ impl MediaBackend for DesktopFfmpeg {
         use sha2::{Digest, Sha256};
         let mut backend = self.clone();
         backend.job = job.clone();
-        let (path, document) = backend.probe_document(path).ok()?;
+        let (path, document) = backend
+            .probe_document(path, ENCODER_ALLOCATION_LIMIT)
+            .ok()?;
         let index = document["streams"]
             .as_array()?
             .iter()
@@ -1048,9 +1130,10 @@ impl DesktopFfmpeg {
                     &args,
                     &cancel,
                     event,
-                    0.45 * elapsed as f32 / total as f32,
-                    0.45 * t.duration_ms as f32 / total as f32,
+                    (0.45 * elapsed as f32 / total as f32)
+                        ..(0.45 * (elapsed + t.duration_ms) as f32 / total as f32),
                     t.duration_ms,
+                    AUDIO_INPUT_ALLOCATION_LIMIT,
                 )?;
                 decoded_durations.push(self.probe(&wav)?.track.duration_ms);
                 list.push_str(&format!("file 'track{i}.wav'\n"));
@@ -1160,7 +1243,45 @@ impl DesktopFfmpeg {
             metadata.into_os_string(),
         ]);
         if let Some(cover) = &p.cover {
-            args.extend(["-i".into(), cover.as_os_str().into()]);
+            // Decode the cover in its own process with the original allocation limit.
+            let staged_cover = stage.path().join("cover.jpg");
+            let image = jobs::capture(
+                command(&self.ffmpeg)
+                    .args([
+                        "-v",
+                        "error",
+                        "-nostdin",
+                        "-n",
+                        "-threads",
+                        "1",
+                        "-max_alloc",
+                    ])
+                    .arg(ENCODER_ALLOCATION_LIMIT.to_string())
+                    .arg("-i")
+                    .arg(cover)
+                    .args([
+                        "-map",
+                        "0:v:0",
+                        "-frames:v",
+                        "1",
+                        "-c:v",
+                        "mjpeg",
+                        "-threads:v",
+                        "1",
+                        "-f",
+                        "image2",
+                        "-update",
+                        "1",
+                    ])
+                    .arg(&staged_cover),
+                &self.job,
+                65536,
+            )?;
+            ensure!(
+                image.status.success() && staged_cover.metadata()?.len() <= 16 * 1024 * 1024,
+                "Export cover conversion failed or exceeds 16 MiB"
+            );
+            args.extend(["-i".into(), staged_cover.into_os_string()]);
         }
         args.extend([
             "-map".into(),
@@ -1198,7 +1319,7 @@ impl DesktopFfmpeg {
                 "-map".into(),
                 "2:v:0".into(),
                 "-c:v".into(),
-                "mjpeg".into(),
+                "copy".into(),
                 "-disposition:v:0".into(),
                 "attached_pic".into(),
             ]);
@@ -1235,7 +1356,16 @@ impl DesktopFfmpeg {
         ));
         event(ExportEvent::Phase(ExportPhase::Encoding));
         let base = if remux { 0. } else { 0.45 };
-        self.run(&args, &cancel, event, base, 0.95 - base, total)?;
+        let max_alloc = if remux {
+            // Copied AAC can have shorter frames and higher sample rates than
+            // staged AAC. Use the bounded ceiling without assuming packet density.
+            AAC_MUX_ALLOCATION_LIMIT
+        } else if p.settings.format == ExportFormat::M4b {
+            aac_mux_allocation_limit(total, ENCODER_ALLOCATION_LIMIT)
+        } else {
+            ENCODER_ALLOCATION_LIMIT
+        };
+        self.run(&args, &cancel, event, base..0.95, total, max_alloc)?;
         event(ExportEvent::Phase(ExportPhase::CheckingOutput));
         if p.settings.format == ExportFormat::M4b {
             mp4::publisher(&temp, &p.metadata.publisher)?;
@@ -1298,6 +1428,8 @@ impl DesktopFfmpeg {
         // Decode the entire encoded stream to catch corrupt/truncated packets before publishing.
         let args = vec![
             "-xerror".into(),
+            "-abort_on".into(),
+            "empty_output".into(),
             "-i".into(),
             temp.as_os_str().into(),
             "-map".into(),
@@ -1307,7 +1439,18 @@ impl DesktopFfmpeg {
             "-".into(),
         ];
         event(ExportEvent::Phase(ExportPhase::VerifyingAudio));
-        self.run(&args, &cancel, event, 0.95, 0.04, total)?;
+        self.run(
+            &args,
+            &cancel,
+            event,
+            0.95..0.99,
+            total,
+            if p.settings.format == ExportFormat::M4b {
+                AUDIO_INPUT_ALLOCATION_LIMIT
+            } else {
+                ENCODER_ALLOCATION_LIMIT
+            },
+        )?;
         event(ExportEvent::Phase(ExportPhase::Publishing));
         ensure!(!cancel.load(AtomicOrdering::Relaxed), "Export cancelled");
         // FlushFileBuffers on Windows requires a write-capable handle.

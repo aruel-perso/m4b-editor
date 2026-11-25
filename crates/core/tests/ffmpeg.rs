@@ -276,6 +276,63 @@ fn mp3_padding_does_not_shift_following_chapters() {
     assert!(probe.track.duration_ms.abs_diff(2000) < 100);
 }
 
+#[test]
+fn long_aac_remux_publishes_after_full_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = DesktopFfmpeg::default();
+    let elementary = dir.path().join("silence.aac");
+    let source = dir.path().join("long.m4a");
+    let output = dir.path().join("long.m4b");
+    // One steady-state frame from FFmpeg's AAC-LC encoding of 48 kHz mono
+    // anullsrc, including its ADTS header and 1024 samples of silence.
+    const SILENT_FRAME: [u8; 11] = [
+        0xff, 0xf1, 0x4c, 0x40, 0x01, 0x7f, 0xfc, 0x01, 0x18, 0x20, 0x07,
+    ];
+    // Over 2.9 million packets cross both the old mux and 24-byte demux
+    // index thresholds. Write in blocks to avoid millions of small writes.
+    use std::io::Write;
+    let mut input = std::fs::File::create(&elementary).unwrap();
+    let block = SILENT_FRAME.repeat(1024);
+    for _ in 0..2839 {
+        input.write_all(&block).unwrap();
+    }
+    drop(input);
+    assert!(Command::new(&backend.ffmpeg)
+        .args(["-v", "error", "-max_alloc", "268435456", "-f", "aac", "-i"])
+        .arg(&elementary)
+        .args(["-t", "62000", "-c:a", "copy", "-f", "ipod"])
+        .arg(&source)
+        .status()
+        .unwrap()
+        .success());
+    let mut project = Project::default();
+    project.import(&backend, vec![source]).unwrap();
+    assert!(project.can_remux());
+    let mut verifying = false;
+    let mut verified_time_us = 0;
+    let mut published = false;
+    backend
+        .export(
+            &project,
+            &output,
+            Arc::new(AtomicBool::new(false)),
+            &mut |event| match event {
+                ExportEvent::Phase(ExportPhase::VerifyingAudio) => verifying = true,
+                ExportEvent::Activity { media_time_us, .. } if verifying => {
+                    verified_time_us = verified_time_us.max(media_time_us);
+                }
+                ExportEvent::Progress(1.) => published = true,
+                _ => {}
+            },
+        )
+        .unwrap();
+    assert!(published && output.is_file());
+    assert!(verified_time_us.abs_diff(62_000_000_000) < 500_000);
+    let track = backend.probe(&output).unwrap().track;
+    assert_eq!(track.codec, "aac");
+    assert!(track.duration_ms.abs_diff(62_000_000) < 500);
+}
+
 /// Opt-in acceptance for a complete multi-track transcode, full output decode,
 /// and cancellation during a running encoder with an isolated destination.
 #[test]
