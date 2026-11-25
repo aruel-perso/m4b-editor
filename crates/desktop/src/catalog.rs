@@ -228,6 +228,10 @@ pub const CATALOG: &[(&str, &str)] = &[
         "Annulation demandée. Fermez à nouveau après la fin de l’opération.",
     ),
     ("Welcome to M4B Editor", "Bienvenue dans M4B Editor"),
+    ("Elapsed / estimated total", "Écoulé / total estimé"),
+    ("Elapsed", "Écoulé"),
+    ("Unknown", "Inconnu"),
+    ("Open release downloads…", "Ouvrir les téléchargements…"),
 ];
 pub fn text(fr: bool, key: &str) -> &'static str {
     let &(en, french) = CATALOG

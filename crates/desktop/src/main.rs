@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod catalog;
 mod diagnostics;
+mod export_timing;
 #[cfg(any(windows, test))]
 mod instance;
 mod playback;
@@ -100,9 +101,9 @@ enum Message {
         PathBuf,
         Box<Result<(Project, m4b_editor_core::ProjectBaseline), String>>,
     ),
-    Event(ExportEvent),
+    Event(ExportEvent, Instant),
     ImportProgress(ImportEvent),
-    Done(Result<Settings, String>),
+    Done(Result<Settings, String>, Instant),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
@@ -148,6 +149,7 @@ struct App {
     exporting: bool,
     export_phase: Option<ExportPhase>,
     export_result: Option<Result<(), String>>,
+    export_timing: Option<export_timing::Timing>,
     import_progress: Option<ImportEvent>,
     #[cfg(windows)]
     instance: Option<instance::Primary>,
@@ -170,16 +172,7 @@ impl Default for App {
         let (tx, rx) = mpsc::channel();
         let recovery_store = recovery::Recovery::new(&state_directory().join("recovery"))
             .expect("Create recovery directory");
-        let mut pending_recoveries =
-            recovery::Recovery::discover(&state_directory().join("recovery"));
-        if !cfg!(test) {
-            if let Some(legacy) = legacy_state_directory()
-                .map(|d| d.join("recovery.autosave.json"))
-                .filter(|p| p.is_file() && !p.with_extension("resolved").exists())
-            {
-                pending_recoveries.push(legacy);
-            }
-        }
+        let pending_recoveries = recovery::Recovery::discover(&state_directory().join("recovery"));
         let installer_error = std::fs::File::open(updater::error_log())
             .ok()
             .and_then(|file| {
@@ -240,6 +233,7 @@ impl Default for App {
             exporting: false,
             export_phase: None,
             export_result: None,
+            export_timing: None,
             import_progress: None,
             #[cfg(windows)]
             instance: None,
@@ -259,6 +253,23 @@ impl Default for App {
         }
     }
 }
+fn configured_state_root(
+    platform: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let absolute = |key| {
+        env(key)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    if platform == "windows" {
+        absolute("LOCALAPPDATA")
+    } else {
+        absolute("XDG_STATE_HOME")
+            .or_else(|| absolute("HOME").map(|home| home.join(".local/state")))
+    }
+}
+
 fn legacy_state_directory() -> Option<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_STATE_HOME"))
@@ -266,19 +277,54 @@ fn legacy_state_directory() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
     Some(root.join("m4b-Craft")) // 0.3 compatibility: preserve originals.
 }
+
 #[cfg(test)]
 fn state_directory() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| tempfile::tempdir().unwrap().keep())
         .clone()
 }
+
+#[cfg(unix)]
+fn private_unix_state(temp: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let uid = unsafe { libc::geteuid() };
+    let path = temp.join(format!("m4b-editor-{uid}"));
+    let mut builder = std::fs::DirBuilder::new();
+    match builder.mode(0o700).create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let info = path.symlink_metadata()?;
+    if !info.is_dir() || info.uid() != uid || info.mode() & 0o7777 != 0o700 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Temporary application state directory is not private",
+        ));
+    }
+    Ok(path)
+}
+
 #[cfg(not(test))]
 fn state_directory() -> PathBuf {
-    let directory = legacy_state_directory()
-        .unwrap_or_else(std::env::temp_dir)
-        .with_file_name("m4b-editor");
-    let _ = std::fs::create_dir_all(&directory);
-    directory
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        if let Some(root) = configured_state_root(std::env::consts::OS, |key| std::env::var_os(key))
+        {
+            return root.join("m4b-editor");
+        }
+        #[cfg(unix)]
+        if let Ok(path) = private_unix_state(&std::env::temp_dir()) {
+            return path;
+        }
+        tempfile::Builder::new()
+            .prefix("m4b-editor-")
+            .tempdir()
+            .expect("Create private temporary application state directory")
+            .keep()
+    })
+    .clone()
 }
 fn preferences_path() -> PathBuf {
     state_directory().join("preferences.json")
@@ -406,7 +452,20 @@ impl App {
     }
 
     fn dismiss_recovery(&mut self) {
-        self.recovery = None;
+        if let Some(prompt) = self.recovery.take() {
+            if let Err(error) = recovery::resolve(&prompt.path) {
+                self.log_error(error.to_string());
+            }
+        }
+    }
+
+    fn clear_recovery(&mut self) {
+        self.recovery_store.clear();
+        if let Some(path) = self.restored_from.take() {
+            if let Err(error) = recovery::resolve(&path) {
+                self.log_error(error.to_string());
+            }
+        }
     }
 
     fn restore_recovery(&mut self) {
@@ -429,6 +488,7 @@ impl App {
             return;
         }
         self.recovery = None;
+        self.clear_recovery();
         self.stop_preview();
         self.project = project;
         self.stream_track = None;
@@ -444,6 +504,7 @@ impl App {
     fn close_project(&mut self) {
         if self.selected && !self.busy && !self.creating && self.confirm_replace() {
             self.stop_preview();
+            self.clear_recovery();
             self.selected = false;
             self.project = Project::default();
             self.path = None;
@@ -650,6 +711,7 @@ impl App {
         }
     }
     fn log_error(&mut self, diagnostic: String) {
+        diagnostics::operation_error();
         self.log(diagnostic.clone());
         self.status = catalog::error(self.prefs.language == "fr", &diagnostic).into();
     }
@@ -682,9 +744,6 @@ impl App {
             self.path.clone()
         };
         if let Some(path) = path {
-            let previous_slot = self
-                .recovery_store
-                .slot(self.path.as_deref(), &self.project);
             let expected = if choose || self.path.is_none() {
                 None
             } else {
@@ -693,23 +752,12 @@ impl App {
             match self.project.save_with_baseline(&path, expected) {
                 Ok(baseline) => {
                     self.baseline = Some(baseline);
-                    let _ = std::fs::remove_file(previous_slot);
-                    if let Some(restored) = self.restored_from.take() {
-                        let _ = std::fs::write(
-                            restored.with_extension("resolved"),
-                            b"Recovered project saved successfully; original retained",
-                        );
-                    }
+                    self.clear_recovery();
                     self.recent_covers.remove(&path);
                     self.path = Some(path);
                     self.remember();
                     self.dirty = false;
-                    {
-                        let recovery = self
-                            .recovery_store
-                            .slot(self.path.as_deref(), &self.project);
-                        let _ = std::fs::remove_file(recovery);
-                    }
+                    diagnostics::project_saved();
                     self.log(self.text("Project saved").into());
                 }
                 Err(e) => self.log_error(format!("{}: {e:#}", self.text("Save error"))),
@@ -871,7 +919,7 @@ impl App {
                     if transition { 6000 } else { 10000 },
                     cancel,
                     &mut |e| {
-                        let _ = tx.send(Message::Event(e));
+                        let _ = tx.send(Message::Event(e, Instant::now()));
                     },
                 )
                 .map(|_| output)
@@ -1007,6 +1055,22 @@ impl App {
         let mut close = false;
         modal(ctx, "running-export", |ui| {
             ui.heading(self.text("Audio export"));
+            if let Some(timing) = &self.export_timing {
+                let now = Instant::now();
+                let elapsed = export_timing::display(timing.elapsed(now));
+                if self.exporting {
+                    let total = timing.estimate(now).map_or_else(
+                        || self.text("Unknown").into(),
+                        |estimate| format!("~{}", export_timing::display(estimate)),
+                    );
+                    ui.label(format!(
+                        "{} {elapsed} / {total}",
+                        self.text("Elapsed / estimated total")
+                    ));
+                } else {
+                    ui.label(format!("{} {elapsed}", self.text("Elapsed")));
+                }
+            }
             if let Some(result) = &self.export_result {
                 match result {
                     Ok(()) => {
@@ -1056,6 +1120,7 @@ impl App {
         });
         if close {
             self.export_result = None;
+            self.export_timing = None;
         }
     }
 
@@ -1129,6 +1194,7 @@ impl App {
         self.exporting = true;
         self.export_phase = None;
         self.export_result = None;
+        self.export_timing = Some(export_timing::Timing::new(Instant::now()));
         self.progress = 0.;
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
@@ -1148,7 +1214,7 @@ impl App {
                     }
                     diagnostic.export_event(&event, progress);
                     if !matches!(event, ExportEvent::Activity { .. }) {
-                        let _ = tx.send(Message::Event(event));
+                        let _ = tx.send(Message::Event(event, Instant::now()));
                     }
                 };
                 if let Some(replacement) = replacement {
@@ -1167,9 +1233,10 @@ impl App {
                 }
                 Ok(())
             })();
+            let finished = Instant::now();
             diagnostic.finish(&result, cancel.load(Ordering::Relaxed));
             let result = result.map(|()| settings).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Message::Done(result));
+            let _ = tx.send(Message::Done(result, finished));
         });
         true
     }
@@ -1335,6 +1402,9 @@ impl App {
                     match *r {
                         Ok(p) => {
                             self.stop_preview();
+                            if path.is_some() {
+                                self.clear_recovery();
+                            }
                             self.project = p;
                             self.stream_track = None;
                             self.stream_choices.clear();
@@ -1343,7 +1413,6 @@ impl App {
                             self.project.settings.language = self.prefs.language.clone();
                             self.selected = true;
                             if path.is_some() {
-                                self.restored_from = None;
                                 self.section = Section::Project;
                             }
                             let clean = matches!(&path, Some(Some(_)));
@@ -1355,17 +1424,37 @@ impl App {
                             }
                             self.remember();
                             self.dirty = !clean;
+                            diagnostics::project_loaded();
                             self.log(self.text("Loaded").into());
                         }
                         Err(e) => self.log_error(e),
                     }
                 }
-                Message::Event(ExportEvent::Log(s)) => self.log(s),
-                Message::Event(ExportEvent::Progress(p)) => self.progress = p,
-                Message::Event(ExportEvent::Phase(phase)) => self.export_phase = Some(phase),
-                Message::Event(ExportEvent::Activity { .. }) => {}
+                Message::Event(event, now) => match event {
+                    ExportEvent::Log(s) => self.log(s),
+                    ExportEvent::Progress(p) => {
+                        self.progress = p;
+                        if self.exporting {
+                            if let Some(timing) = &mut self.export_timing {
+                                timing.progress(p, now);
+                            }
+                        }
+                    }
+                    ExportEvent::Phase(phase) => {
+                        if self.exporting {
+                            if let Some(timing) = &mut self.export_timing {
+                                timing.phase(&phase, now);
+                            }
+                            self.export_phase = Some(phase);
+                        }
+                    }
+                    ExportEvent::Activity { .. } => {}
+                },
                 Message::ImportProgress(phase) => self.import_progress = Some(phase),
-                Message::Done(r) => {
+                Message::Done(r, now) => {
+                    if let Some(timing) = &mut self.export_timing {
+                        timing.finish(now);
+                    }
                     self.export_result = Some(r.as_ref().map(|_| ()).map_err(Clone::clone));
                     self.busy = false;
                     self.exporting = false;
@@ -1395,6 +1484,7 @@ impl App {
         if !self.busy && !self.allow_close && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.confirm_replace() {
+                self.clear_recovery();
                 self.allow_close = true;
                 self.dirty = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1402,7 +1492,9 @@ impl App {
         }
         if !self.startup_checked && !self.busy && !self.playback.is_busy() {
             self.startup_checked = true;
-            self.check_updates();
+            if updater::supported() {
+                self.check_updates();
+            }
         }
         if self.recovery.is_none() {
             self.recovery = self.pending_recoveries.pop().map(recovery::Prompt::new);
@@ -1518,13 +1610,8 @@ impl App {
             },
         );
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(15) {
-            {
-                let path = self
-                    .recovery_store
-                    .slot(self.path.as_deref(), &self.project);
-                if let Err(e) = self.project.save(&path) {
-                    self.log(format!("{}: {e:#}", self.text("Autosave")));
-                }
+            if let Err(e) = self.project.save(&self.recovery_store.slot()) {
+                self.log_error(format!("{}: {e:#}", self.text("Autosave")));
             }
             self.last_save = Instant::now();
         }
@@ -1646,7 +1733,7 @@ impl App {
                             self.log_error(error.to_string());
                         }
                     }
-                    if ui
+                    if updater::supported() && ui
                         .add_enabled(
                             !self.checking && !self.busy && !self.playback.is_busy(),
                             egui::Button::new(self.text("Check for updates…")),
@@ -1654,6 +1741,13 @@ impl App {
                         .clicked()
                     {
                         self.check_updates();
+                        ui.close_menu();
+                    } else if !updater::supported()
+                        && ui.button(self.text("Open release downloads…")).clicked()
+                    {
+                        ctx.open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/aruel-perso/m4b-editor/releases/latest",
+                        ));
                         ui.close_menu();
                     }
                 });
@@ -1810,9 +1904,9 @@ impl App {
                             match project.save_new(&path) {
                                 Ok(()) => {
                                     self.stop_preview();
+                                    self.clear_recovery();
                                     self.project = project;
                                     self.baseline = None;
-                                    self.restored_from = None;
                                     self.stream_track = None;
                                     self.stream_choices.clear();
                                     self.selected = true;
@@ -1836,7 +1930,18 @@ impl App {
         }
         if !self.selected {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading(self.text("Welcome to M4B Editor"));
+                let heading = self.text("Welcome to M4B Editor");
+                let font = egui::TextStyle::Heading.resolve(ui.style());
+                let galley = ui.painter().layout(
+                    heading.into(),
+                    font,
+                    ui.visuals().text_color(),
+                    ui.available_width(),
+                );
+                let center = ui.available_rect_before_wrap().center();
+                let rect = egui::Rect::from_center_size(center, galley.size());
+                ui.painter()
+                    .galley(rect.min, galley, ui.visuals().text_color());
                 ui.add_enabled_ui(!self.busy && !self.creating && !modal_open, |ui| {
                     if ui.button(self.text("Create project…")).clicked() {
                         self.creating = true;
@@ -1848,54 +1953,62 @@ impl App {
                     if !self.busy && !modal_open {
                         self.queue_recent_cover();
                     }
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for path in self.prefs.recent.clone() {
-                            ui.horizontal(|ui| {
-                                let size = egui::vec2(48., 48.);
-                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                                if let Some(Some(texture)) = self.recent_covers.get(&path) {
-                                    let original = texture.size_vec2();
-                                    let image_size = original * (48. / original.x.max(original.y));
-                                    ui.painter().image(
-                                        texture.id(),
-                                        egui::Rect::from_center_size(rect.center(), image_size),
-                                        egui::Rect::from_min_max(
-                                            egui::Pos2::ZERO,
-                                            egui::pos2(1., 1.),
-                                        ),
-                                        egui::Color32::WHITE,
+                    let recent_height = (rect.top() - ui.cursor().top() - 8.).max(0.);
+                    egui::ScrollArea::vertical()
+                        .max_height(recent_height)
+                        .show(ui, |ui| {
+                            for path in self.prefs.recent.clone() {
+                                ui.horizontal(|ui| {
+                                    let size = egui::vec2(48., 48.);
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(size, egui::Sense::hover());
+                                    if let Some(Some(texture)) = self.recent_covers.get(&path) {
+                                        let original = texture.size_vec2();
+                                        let image_size =
+                                            original * (48. / original.x.max(original.y));
+                                        ui.painter().image(
+                                            texture.id(),
+                                            egui::Rect::from_center_size(rect.center(), image_size),
+                                            egui::Rect::from_min_max(
+                                                egui::Pos2::ZERO,
+                                                egui::pos2(1., 1.),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            3.,
+                                            ui.visuals().faint_bg_color,
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button("×")
+                                                .on_hover_text(self.text("Remove from recents"))
+                                                .clicked()
+                                            {
+                                                self.remove_recent = Some(path.clone());
+                                            }
+                                            let label = path.display().to_string();
+                                            if ui
+                                                .add_enabled(
+                                                    path.is_file(),
+                                                    egui::Button::new(&label)
+                                                        .wrap_mode(egui::TextWrapMode::Truncate),
+                                                )
+                                                .on_hover_text(&label)
+                                                .clicked()
+                                            {
+                                                self.load_path(path);
+                                            }
+                                        },
                                     );
-                                } else {
-                                    ui.painter()
-                                        .rect_filled(rect, 3., ui.visuals().faint_bg_color);
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text(self.text("Remove from recents"))
-                                            .clicked()
-                                        {
-                                            self.remove_recent = Some(path.clone());
-                                        }
-                                        let label = path.display().to_string();
-                                        if ui
-                                            .add_enabled(
-                                                path.is_file(),
-                                                egui::Button::new(&label)
-                                                    .wrap_mode(egui::TextWrapMode::Truncate),
-                                            )
-                                            .on_hover_text(&label)
-                                            .clicked()
-                                        {
-                                            self.load_path(path);
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    });
+                                });
+                            }
+                        });
                 });
             });
             self.finish_frame(ctx, recovery_open);
@@ -2256,14 +2369,13 @@ impl eframe::App for App {
         let _ = self.prefs.save(&preferences_path());
         self.playback.send(AudioCommand::Exit);
         self.cancel.store(true, Ordering::Relaxed);
-        if self.dirty {
-            {
-                let path = self
-                    .recovery_store
-                    .slot(self.path.as_deref(), &self.project);
-                let _ = self.project.save(&path);
+        if self.dirty && !self.allow_close {
+            self.recovery_store.preserve_on_exit();
+            if let Err(error) = self.project.save(&self.recovery_store.slot()) {
+                self.log_error(error.to_string());
             }
         }
+        diagnostics::shutdown();
     }
 }
 
@@ -2584,6 +2696,167 @@ mod release040_ui_tests {
             .collect()
     }
 
+    fn text_shape(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.visual_bounding_rect())
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_shape(shape, label)),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_state_rejects_public_directories_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let path = private_unix_state(temp.path()).unwrap();
+        assert_eq!(private_unix_state(temp.path()).unwrap(), path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_unix_state(temp.path()).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        symlink(temp.path(), &path).unwrap();
+        assert!(private_unix_state(temp.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_skips_unsupported_updater() {
+        let mut app = App::default();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(app.startup_checked && !app.checking);
+    }
+
+    #[test]
+    fn welcome_heading_is_centered_in_both_languages_when_resized() {
+        let mut app = App {
+            startup_checked: true,
+            ..App::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("recent.m4bproj");
+        Project::named("Recent").unwrap().save(&project).unwrap();
+        app.prefs.recent = vec![project.clone()];
+        app.recent_covers.insert(project.clone(), None);
+        let ctx = egui::Context::default();
+        for (language, label) in [
+            ("en", "Welcome to M4B Editor"),
+            ("fr", "Bienvenue dans M4B Editor"),
+        ] {
+            app.prefs.language = language.into();
+            for size in [egui::vec2(560., 480.), egui::vec2(1040., 700.)] {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ctx| app.render(ctx),
+                );
+                let visible_text = |label| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| {
+                            text_shape(&shape.shape, label)
+                                .filter(|rect| shape.clip_rect.contains_rect(*rect))
+                        })
+                        .unwrap_or_else(|| panic!("Expected visible text: {label}"))
+                };
+                let heading = visible_text(label);
+                for action in ["Create project…", "Open project…", "Recent projects"] {
+                    assert!(visible_text(app.text(action)).bottom() < heading.top());
+                }
+                assert!(visible_text(&project.display().to_string()).bottom() < heading.top());
+                let center = heading.center();
+                assert!((center.x - size.x / 2.).abs() < 4., "{center:?} {size:?}");
+                // The central panel may sit below the menu bar.
+                assert!((center.y - size.y / 2.).abs() < 12., "{center:?} {size:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn successful_save_clears_autosave_and_close_leaves_project_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved.m4bproj");
+        let mut app = App {
+            project: Project::named("Edited").unwrap(),
+            path: Some(path.clone()),
+            dirty: true,
+            selected: true,
+            ..App::default()
+        };
+        let slot = app.recovery_store.slot();
+        app.project.save(&slot).unwrap();
+        app.save(false);
+        assert!(!app.dirty);
+        assert!(!slot.exists());
+        app.close_project();
+        assert!(!app.selected);
+        assert_eq!(Project::load(&path).unwrap().name, "Edited");
+    }
+
+    #[test]
+    fn export_end_preserves_elapsed_for_success_cancellation_and_failure() {
+        let started = Instant::now() - Duration::from_secs(4);
+        let elapsed = Duration::from_secs(7);
+        let ctx = egui::Context::default();
+        for result in [
+            Ok(Settings::default()),
+            Err("Export cancelled".into()),
+            Err("Synthetic export failure".into()),
+        ] {
+            let mut app = App {
+                startup_checked: true,
+                busy: true,
+                exporting: true,
+                export_timing: Some(export_timing::Timing::new(started)),
+                ..App::default()
+            };
+            app.prefs.language = "en".into();
+            let frame = |app: &mut App| {
+                // Area performs an invisible sizing pass when it first opens.
+                let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+                ctx.run(egui::RawInput::default(), |ctx| app.render(ctx))
+            };
+            let shows = |output: &egui::FullOutput, label: &str| {
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|shape| text_shape(&shape.shape, label).is_some()),
+                    "{label}"
+                );
+            };
+            let running = frame(&mut app);
+            let running_label = "Elapsed / estimated total ";
+            assert!(running.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.text().starts_with(running_label)
+                        && text.galley.text().ends_with(" / Unknown"))
+            }));
+            let timing = app.export_timing.as_mut().unwrap();
+            timing.phase(&ExportPhase::Encoding, started);
+            timing.progress(0.25, started + Duration::from_secs(3));
+            let estimated = frame(&mut app);
+            assert!(estimated.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.text().starts_with(running_label)
+                        && text.galley.text().contains(" / ~"))
+            }));
+            app.tx
+                .send(Message::Done(result, started + elapsed))
+                .unwrap();
+            shows(&frame(&mut app), "Elapsed 00:07");
+            assert!(!app.exporting);
+            let timing = app.export_timing.as_ref().unwrap();
+            assert_eq!(timing.elapsed(started + elapsed * 2), elapsed);
+            assert!(timing.estimate(started + elapsed * 2).is_none());
+        }
+    }
+
     #[test]
     fn export_modal_retains_terminal_error_until_dismissed() {
         let mut app = App {
@@ -2596,10 +2869,13 @@ mod release040_ui_tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
         assert!(app.export_result.is_none());
         app.tx
-            .send(Message::Event(ExportEvent::Progress(0.63)))
+            .send(Message::Event(ExportEvent::Progress(0.63), Instant::now()))
             .unwrap();
         app.tx
-            .send(Message::Done(Err("Synthetic encoder failure".into())))
+            .send(Message::Done(
+                Err("Synthetic encoder failure".into()),
+                Instant::now(),
+            ))
             .unwrap();
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
         assert_eq!(app.progress, 0.63);
@@ -2655,7 +2931,7 @@ mod release040_ui_tests {
     }
 
     #[test]
-    fn recovery_queue_restores_as_unsaved_and_dismisses_without_writes() {
+    fn recovery_queue_restores_as_unsaved_and_persists_dismissal() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.m4bproj");
         let second = dir.path().join("second.m4bproj");
@@ -2699,6 +2975,8 @@ mod release040_ui_tests {
         );
         assert_eq!(app.recovery.as_ref().unwrap().path, second);
         app.dismiss_recovery();
+        assert!(second.with_extension("resolved").is_file());
+        assert!(!first.with_extension("resolved").exists());
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
         assert!(app.recovery.is_none());
         assert_eq!(

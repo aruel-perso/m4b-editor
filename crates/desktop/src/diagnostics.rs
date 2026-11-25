@@ -48,6 +48,10 @@ impl Log {
             std::process::id(),
             fields
         );
+        anyhow::ensure!(
+            entry.len() as u64 <= self.limit,
+            "Diagnostic record exceeds log capacity"
+        );
         let current = self.path(0);
         if current.metadata().map_or(0, |m| m.len()) + entry.len() as u64 > self.limit {
             let oldest = self.path(2);
@@ -95,19 +99,40 @@ fn record(fields: impl std::fmt::Display) {
     }
 }
 
-pub fn init() {
-    let directory = super::state_directory().join("logs");
-    if fs::create_dir_all(&directory).is_err()
-        || LOG
-            .set(Mutex::new(Log {
-                directory,
-                limit: LIMIT,
-            }))
-            .is_err()
-    {
-        return;
+fn log_directory(platform: &str, state: &Path, home: Option<PathBuf>) -> PathBuf {
+    if platform == "macos" {
+        if let Some(home) = home.filter(|path| path.is_absolute()) {
+            return home.join("Library/Logs/m4b-editor/log");
+        }
     }
-    record(format_args!(
+    state.join("log")
+}
+
+fn directory() -> PathBuf {
+    log_directory(
+        std::env::consts::OS,
+        &super::state_directory(),
+        if cfg!(test) {
+            None
+        } else {
+            std::env::var_os("HOME").map(PathBuf::from)
+        },
+    )
+}
+
+fn start_log(directory: PathBuf, old: &Path) -> anyhow::Result<Log> {
+    if !directory.exists() && old.is_dir() {
+        if let Some(parent) = directory.parent() {
+            fs::create_dir_all(parent)?;
+            let _ = fs::rename(old, &directory);
+        }
+    }
+    fs::create_dir_all(&directory)?;
+    let log = Log {
+        directory,
+        limit: LIMIT,
+    };
+    let _ = log.record(format_args!(
         "application_start version={} os={} arch={} profile={}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
@@ -118,6 +143,23 @@ pub fn init() {
             "release"
         }
     ));
+    Ok(log)
+}
+
+pub fn init() {
+    static INIT: Mutex<()> = Mutex::new(());
+    let Ok(_guard) = INIT.lock() else {
+        return;
+    };
+    if LOG.get().is_some() {
+        return;
+    }
+    let Ok(log) = start_log(directory(), &super::state_directory().join("logs")) else {
+        return;
+    };
+    if LOG.set(Mutex::new(log)).is_err() {
+        return;
+    }
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(log) = LOG.get().and_then(|log| log.try_lock().ok()) {
@@ -125,6 +167,22 @@ pub fn init() {
         }
         previous_hook(info);
     }));
+}
+
+pub fn shutdown() {
+    record("application_exit");
+}
+
+pub fn operation_error() {
+    record("severity=error event=desktop_operation_failed");
+}
+
+pub fn project_saved() {
+    record("event=project_saved");
+}
+
+pub fn project_loaded() {
+    record("event=project_loaded");
 }
 
 pub fn export(destination: &Path) -> anyhow::Result<()> {
@@ -135,7 +193,7 @@ pub fn export(destination: &Path) -> anyhow::Result<()> {
 }
 
 pub fn open_folder() -> io::Result<()> {
-    let directory = super::state_directory().join("logs");
+    let directory = directory();
     fs::create_dir_all(&directory)?;
     let program = if cfg!(windows) {
         "explorer.exe"
@@ -238,8 +296,13 @@ impl Job {
                 exit_code,
                 outcome,
             } if outcome != "running" || Instant::now() >= self.next_activity => {
+                let severity = match (outcome, stderr_category) {
+                    ("failed", _) => "error",
+                    ("running" | "completed", "none") => "info",
+                    _ => "warning",
+                };
                 self.record(format_args!(
-                    "encoder={outcome} progress={progress:.4} media_time_us={media_time_us} idle_ms={idle_ms} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes} stderr_category={stderr_category} exit_code={exit_code:?}"
+                    "severity={severity} encoder={outcome} progress={progress:.4} media_time_us={media_time_us} idle_ms={idle_ms} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes} stderr_category={stderr_category} exit_code={exit_code:?}"
                 ));
                 self.next_activity = Instant::now() + Duration::from_secs(5);
             }
@@ -287,6 +350,42 @@ impl Drop for Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_paths_create_and_rotate_startup_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("LocalAppData");
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        for (platform, with_xdg, expected) in [
+            ("windows", true, local.join("m4b-editor/log")),
+            ("macos", true, home.join("Library/Logs/m4b-editor/log")),
+            ("linux", true, xdg.join("m4b-editor/log")),
+            ("linux", false, home.join(".local/state/m4b-editor/log")),
+        ] {
+            let env = |key: &str| match key {
+                "LOCALAPPDATA" => Some(local.clone().into_os_string()),
+                "HOME" => Some(home.clone().into_os_string()),
+                "XDG_STATE_HOME" if with_xdg => Some(xdg.clone().into_os_string()),
+                _ => None,
+            };
+            let state = crate::configured_state_root(platform, env)
+                .unwrap()
+                .join("m4b-editor");
+            let directory = log_directory(platform, &state, env("HOME").map(PathBuf::from));
+            assert_eq!(directory, expected);
+            let log = start_log(directory.clone(), &state.join("logs")).unwrap();
+            assert!(fs::read_to_string(log.path(0))
+                .unwrap()
+                .contains("application_start"));
+            fs::write(log.path(0), vec![b'x'; LIMIT as usize]).unwrap();
+            let reopened = start_log(directory, &state.join("logs")).unwrap();
+            assert_eq!(reopened.path(1).metadata().unwrap().len(), LIMIT);
+            assert!(fs::read_to_string(reopened.path(0))
+                .unwrap()
+                .contains("application_start"));
+        }
+    }
 
     #[test]
     fn bounded_rotation_and_export_in_time_order() {
@@ -358,8 +457,7 @@ exit 23
             .contains("raw-stderr-private.mp3"));
         assert!(!output.exists());
         log_job.finish(&result, false);
-        let log = fs::read_to_string(super::super::state_directory().join("logs/diagnostic-0.log"))
-            .unwrap();
+        let log = fs::read_to_string(directory().join("diagnostic-0.log")).unwrap();
         assert!(log.contains("encoder=failed"));
         assert!(log.contains("stderr_category=permission_denied exit_code=Some(23)"));
         assert!(!log.contains("raw-stderr-private.mp3"));
@@ -378,8 +476,7 @@ exit 23
             &Err(anyhow::anyhow!("https://private?token=super-secret")),
             false,
         );
-        let log = fs::read_to_string(super::super::state_directory().join("logs/diagnostic-0.log"))
-            .unwrap();
+        let log = fs::read_to_string(directory().join("diagnostic-0.log")).unwrap();
         assert!(log.contains("phase=probing done=1 total=2"));
         assert!(log.contains("job_end outcome=failed"));
         assert!(!log.contains("private"));

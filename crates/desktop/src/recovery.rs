@@ -1,6 +1,5 @@
-//! Crash recovery is scoped to a project and a unique running instance.
+//! Crash recovery for the current project in each running instance.
 use m4b_editor_core::Project;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +18,10 @@ impl Prompt {
         let name = Project::load(&path).map(|project| project.name);
         Self { path, name, date }
     }
+}
+
+pub fn resolve(path: &Path) -> std::io::Result<()> {
+    std::fs::write(path.with_extension("resolved"), b"Recovery resolved")
 }
 
 fn utc_date(modified: SystemTime) -> Option<String> {
@@ -61,6 +64,7 @@ fn utc_date(modified: SystemTime) -> Option<String> {
 
 pub struct Recovery {
     directory: PathBuf,
+    preserve_on_drop: bool,
 }
 impl Recovery {
     pub fn new(root: &Path) -> std::io::Result<Self> {
@@ -70,14 +74,19 @@ impl Recovery {
             .tempdir_in(root)?
             .keep();
         std::fs::write(directory.join("owner"), std::process::id().to_string())?;
-        Ok(Self { directory })
+        Ok(Self {
+            directory,
+            preserve_on_drop: false,
+        })
     }
-    pub fn slot(&self, path: Option<&Path>, project: &Project) -> PathBuf {
-        let identity = path
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("unsaved:{}", project.name));
-        self.directory
-            .join(format!("{:x}.m4bproj", Sha256::digest(identity.as_bytes())))
+    pub fn slot(&self) -> PathBuf {
+        self.directory.join("current.m4bproj")
+    }
+    pub fn clear(&self) {
+        let _ = std::fs::remove_file(self.slot());
+    }
+    pub fn preserve_on_exit(&mut self) {
+        self.preserve_on_drop = true;
     }
     pub fn discover(root: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
@@ -90,13 +99,15 @@ impl Recovery {
                 let pid = std::fs::read_to_string(directory.join("owner"))
                     .ok()
                     .and_then(|p| p.parse().ok());
-                if pid.is_some_and(alive) {
+                // Older versions removed the owner on normal exit but left stale slots.
+                if pid.is_none_or(|pid| pid == 0 || alive(pid)) {
                     continue;
                 }
                 if let Ok(slots) = std::fs::read_dir(directory) {
                     found.extend(slots.flatten().map(|s| s.path()).filter(|p| {
                         p.extension().is_some_and(|e| e == "m4bproj")
                             && !p.with_extension("resolved").exists()
+                            && Project::load(p).is_ok()
                     }));
                 }
             }
@@ -107,6 +118,10 @@ impl Recovery {
 }
 impl Drop for Recovery {
     fn drop(&mut self) {
+        if self.preserve_on_drop || std::thread::panicking() {
+            return;
+        }
+        self.clear();
         let _ = std::fs::remove_file(self.directory.join("owner"));
         let _ = std::fs::remove_dir(&self.directory);
     }
@@ -147,18 +162,36 @@ mod tests {
     }
 
     #[test]
-    fn independent_slots_live_conflicts_and_crash_discovery() {
+    fn only_abandoned_valid_unresolved_snapshots_are_discovered() {
         let root = tempfile::tempdir().unwrap();
-        let a = Recovery::new(root.path()).unwrap();
-        let b = Recovery::new(root.path()).unwrap();
-        let p = Project::named("Book").unwrap();
-        let slot = a.slot(Some(Path::new("a.m4bproj")), &p);
-        assert_ne!(slot, a.slot(Some(Path::new("b.m4bproj")), &p));
-        assert_ne!(slot, b.slot(Some(Path::new("a.m4bproj")), &p));
-        p.save_new(&slot).unwrap();
+        let clean = Recovery::new(root.path()).unwrap();
+        let interrupted = Recovery::new(root.path()).unwrap();
+        let project = Project::named("Book").unwrap();
+        project.save_new(&clean.slot()).unwrap();
+        project.save_new(&interrupted.slot()).unwrap();
+        assert_ne!(clean.slot(), interrupted.slot());
         assert!(Recovery::discover(root.path()).is_empty());
-        drop(a);
-        assert_eq!(Recovery::discover(root.path()), vec![slot.clone()]);
-        assert_eq!(Project::load(&slot).unwrap().name, "Book");
+        let clean_slot = clean.slot();
+        clean.clear(); // Successful project save
+        assert!(!clean_slot.exists());
+        project.save_new(&clean_slot).unwrap();
+        drop(clean); // Normal close
+        assert!(!clean_slot.exists());
+        let abandoned = interrupted.slot();
+        #[cfg(unix)]
+        let dead_pid = i32::MAX.to_string();
+        #[cfg(windows)]
+        let dead_pid = u32::MAX.to_string();
+        std::fs::write(interrupted.directory.join("owner"), dead_pid).unwrap();
+        let stale = root.path().join("instance-legacy-clean");
+        std::fs::create_dir(&stale).unwrap();
+        project.save_new(&stale.join("stale.m4bproj")).unwrap();
+        assert_eq!(Recovery::discover(root.path()), vec![abandoned.clone()]);
+        resolve(&abandoned).unwrap();
+        assert!(Recovery::discover(root.path()).is_empty());
+        assert_eq!(Project::load(&abandoned).unwrap().name, "Book");
+        std::fs::remove_file(abandoned.with_extension("resolved")).unwrap();
+        std::fs::write(&abandoned, b"invalid").unwrap();
+        assert!(Recovery::discover(root.path()).is_empty());
     }
 }
